@@ -19,6 +19,7 @@ from pyweixin.ocr.wechat_id import (
 )
 from pyweixin.ocr.validator import normalize_candidate, validate_wechat_id
 from pyweixin.ocr.roi import fallback_profile_roi
+from pyweixin.ocr import capture
 
 
 def token(text, x, y=10, confidence=0.99, width=60, height=16):
@@ -235,3 +236,23 @@ def test_roi_geometry_and_model_load_errors_are_fail_closed():
         bottom = 0
 
     assert fallback_profile_roi(Empty()) is None
+
+
+def test_profile_capture_uses_accessible_rectangle(monkeypatch):
+    class Rect:
+        left, top, right, bottom = 10, 20, 310, 220
+
+    class Window:
+        def rectangle(self):
+            return Rect()
+
+    seen = {}
+
+    def fake_grab(**kwargs):
+        seen.update(kwargs)
+        return Image.new("RGB", (1, 1))
+
+    monkeypatch.setattr(capture.ImageGrab, "grab", fake_grab)
+    capture.capture_profile_image(Window(), Window())
+    assert seen["bbox"] == (10, 20, 310, 220)
+    assert seen["all_screens"] is True

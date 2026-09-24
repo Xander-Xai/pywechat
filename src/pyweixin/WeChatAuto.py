@@ -66,7 +66,6 @@ import win32clipboard
 import win32con
 import win32gui
 from packaging import version  # 字符串版本比较,4.1.9>4.1.8>4.1.7
-from PIL import ImageGrab
 from pywinauto import WindowSpecification
 from pywinauto.controls.uia_controls import (
     ListItemWrapper,
@@ -82,10 +81,9 @@ from .Errors import (
     NotFriendError,
     TimeNotCorrectError,
 )
-from .ocr import WeChatIdExtractor, extract_wechat_id_from_uia
+from .ocr import extract_wechat_id_from_uia
+from .ocr.capture import extract_profile_wechat_id
 from .ocr.masking import mask_wechat_id
-from .ocr.result import WeChatIdResult
-from .ocr.roi import fallback_profile_roi
 from .ocr.wechat_id import reconcile_ocr_result
 from .Uielements import (
     Buttons,
@@ -1103,38 +1101,8 @@ class Contacts():
                     break
             items[first_friend].click_input()
 
-        _last_profile_image = None
-
         def _extract_profile_wechat_id():
-            nonlocal _last_profile_image
-            try:
-                rect = contact_profile.rectangle()
-                left, top, right, bottom = rect.left, rect.top, rect.right, rect.bottom
-                if right <= left or bottom <= top:
-                    raise ValueError("empty profile rectangle")
-            except Exception:
-                # UIA panel unavailable: estimate a right-side profile ROI
-                # from the client window, never from absolute screen pixels.
-                try:
-                    rect = main_window.rectangle()
-                    fallback = fallback_profile_roi(rect)
-                    if fallback is None:
-                        raise ValueError("empty window rectangle")
-                    left, top, right, bottom = fallback
-                except Exception:
-                    return WeChatIdResult(
-                        status="OCR_FAILED", reason="profile_roi_unavailable"
-                    )
-            try:
-                _last_profile_image = ImageGrab.grab(
-                    bbox=(left, top, right, bottom), all_screens=True
-                )
-                return WeChatIdExtractor().extract(_last_profile_image)
-            except Exception as exc:
-                return WeChatIdResult(
-                    status="OCR_FAILED",
-                    reason=f"profile_capture_failed:{type(exc).__name__}",
-                )
+            return extract_profile_wechat_id(contact_profile, main_window)
 
         # 获取右侧好友信息面板
         def get_specific_info():
@@ -1448,22 +1416,29 @@ class Contacts():
         
         #获取右侧好友信息面板内的具体信息
         def get_specific_info():
-            texts=contact_profile.descendants(control_type='Text')
-            texts=[item.window_text() for item in texts]
-            name=texts[0]
-            wx_number=texts[texts.index(wxnum_label)+1]
+            ocr_result=extract_profile_wechat_id(contact_profile, main_window)
+            try:
+                texts=[item.window_text() for item in contact_profile.descendants(control_type='Text')]
+            except Exception:
+                texts=[]
+            name=texts[0] if texts else '无'
+            ui_candidate=extract_wechat_id_from_uia(texts)
+            ocr_result=reconcile_ocr_result(ocr_result, ui_candidate)
+            wx_number=ocr_result.value if ocr_result.is_confirmed else '无'
             if friendProfile_label in texts:
                 description=texts[texts.index(friendProfile_label)+1]  
             else: 
                 description='无'
-            info={'名称':name,'微信号':wx_number,'描述':description}
+            info={'名称':name,'微信号':wx_number,'描述':description,
+                '微信号状态':ocr_result.status,'微信号来源':ocr_result.source,
+                '微信号置信度':ocr_result.confidence,'微信号原因':ocr_result.reason or '',
+                '微信号候选':ocr_result.value or ' | '.join(v for v in ocr_result.ocr_candidates if v) or ocr_result.ui_candidate}
             return info
         
         if is_maximize is None:
             is_maximize=GlobalConfig.is_maximize
         if close_weixin is None:
             close_weixin=GlobalConfig.close_weixin
-        wxnum_label=Special_Labels.WxNum
         friendProfile_label=Special_Labels.FriendProfile
         friends_detail=[]
         #通讯录列表
@@ -1535,22 +1510,29 @@ class Contacts():
         
         #获取右侧好友信息面板内的具体信息
         def get_specific_info():
-            texts=contact_profile.descendants(control_type='Text')
-            texts=[item.window_text() for item in texts]
-            name=texts[0]
-            wx_number=texts[texts.index(wxnum_label)+1]
+            ocr_result=extract_profile_wechat_id(contact_profile, main_window)
+            try:
+                texts=[item.window_text() for item in contact_profile.descendants(control_type='Text')]
+            except Exception:
+                texts=[]
+            name=texts[0] if texts else '无'
+            ui_candidate=extract_wechat_id_from_uia(texts)
+            ocr_result=reconcile_ocr_result(ocr_result, ui_candidate)
+            wx_number=ocr_result.value if ocr_result.is_confirmed else '无'
             if friendProfile_label in texts:
                 description=texts[texts.index(friendProfile_label)+1]  
             else: 
                 description='无'
-            info={'名称':name,'微信号':wx_number,'描述':description}
+            info={'名称':name,'微信号':wx_number,'描述':description,
+                '微信号状态':ocr_result.status,'微信号来源':ocr_result.source,
+                '微信号置信度':ocr_result.confidence,'微信号原因':ocr_result.reason or '',
+                '微信号候选':ocr_result.value or ' | '.join(v for v in ocr_result.ocr_candidates if v) or ocr_result.ui_candidate}
             return info
         
         if is_maximize is None:
             is_maximize=GlobalConfig.is_maximize
         if close_weixin is None:
             close_weixin=GlobalConfig.close_weixin
-        wxnum_label=Special_Labels.WxNum
         friendProfile_label=Special_Labels.FriendProfile
         friends_detail=[]
         #通讯录列表
@@ -1751,7 +1733,6 @@ class Contacts():
             close_weixin=GlobalConfig.close_weixin
         if search_pages is None:
             search_pages=GlobalConfig.search_pages
-        wxnum_label=Special_Labels.WxNum
         nickname_label=Special_Labels.Nickname
         region_label=Special_Labels.Region
         remark_label=Special_Labels.Remark
@@ -1776,10 +1757,16 @@ class Contacts():
         no_need_labels=['企业','昵称：','备注','实名','职务','员工状态','朋友圈','工作时间',
         '在线时间','地址','发消息','语音聊天','视频聊天','企业信息','来自','企业微信']
         profile_pane,main_window=Navigator.open_friend_profile(friend=friend,search_pages=search_pages,is_maximize=is_maximize)
-        text_uis=profile_pane.descendants(control_type='Text')
-        texts=[item.window_text() for item in text_uis]
-        nickname=texts[0]#昵称肯定有
-        if wxnum_label in texts:wx_number=texts[texts.index(wxnum_label)+1]
+        ocr_result=extract_profile_wechat_id(profile_pane, main_window)
+        try:
+            text_uis=profile_pane.descendants(control_type='Text')
+            texts=[item.window_text() for item in text_uis]
+        except Exception:
+            texts=[]
+        nickname=texts[0] if texts else '无'
+        ui_candidate=extract_wechat_id_from_uia(texts)
+        ocr_result=reconcile_ocr_result(ocr_result, ui_candidate)
+        wx_number=ocr_result.value if ocr_result.is_confirmed else '无'
         if nickname_label in texts:nickname=texts[texts.index(nickname_label)+1]
         if region_label in texts:region=texts[texts.index(region_label)+1]
         if remark_label in texts:
@@ -1792,7 +1779,11 @@ class Contacts():
         if description_label in texts:  descrption=texts[texts.index(description_label)+1]
         if tags_label in texts:tag=texts[texts.index(tags_label)+1]
         if privacy_label in texts:privacy=texts[texts.index(privacy_label)+1]
-        profile={'昵称':nickname,'微信号':wx_number,'地区':region,'备注':remark,'电话':mobile,
+        profile={'昵称':nickname,'微信号':wx_number,'微信号状态':ocr_result.status,
+        '微信号来源':ocr_result.source,'微信号置信度':ocr_result.confidence,
+        '微信号原因':ocr_result.reason or '',
+        '微信号候选':ocr_result.value or ' | '.join(v for v in ocr_result.ocr_candidates if v) or ocr_result.ui_candidate,
+        '地区':region,'备注':remark,'电话':mobile,
         '标签':tag,'描述':descrption,'朋友权限':privacy,'共同群聊':f'{common_group_num}','个性签名':signature,'来源':source}
         main_window.child_window(**Buttons.ChatInfoButton).click_input()#点一下聊天信息按钮关闭侧边栏
         if close_weixin:main_window.close()
