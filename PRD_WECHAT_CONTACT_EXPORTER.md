@@ -128,4 +128,4 @@ TXT（`output/wechat_contacts_YYYYMMDD_HHMMSS.txt`）：
 - 批量导入联系人
 - 同步到第三方通讯录
 - 云同步 / Web 服务
-- OCR 兜底读取（当 UI 树不可见时）
+- 微信号 OCR-primary 提取与 UIA-secondary 交叉校验（见 `docs/wechat-id-ocr.md`）
