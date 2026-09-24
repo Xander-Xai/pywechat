@@ -42,6 +42,7 @@ import pyautogui
 from warnings import warn
 from typing import Literal
 from pywinauto import WindowSpecification
+from .ocr_adapter import inspect_profile as _inspect_wechat_profile
 ######################内部依赖#######################
 from .Config import GlobalConfig
 from .Warnings import LongTextWarning,ChatHistoryNotEnough
@@ -5009,7 +5010,7 @@ class Contacts():
                     base_info_pane=main_window.children(title='',control_type='Pane')[1].children(title='',control_type='Pane')[0].children(title='',control_type='Pane')[1].children(title='',control_type='Pane')[0].children(title='',control_type='Pane')[0].children(title='',control_type='Pane')[0].children(title='',control_type='Pane')[0].children(title='',control_type='Pane')[0].children(title='',control_type='Pane')[0]
                 except IndexError:
                     base_info_pane=main_window.children(title='',control_type='Pane')[0].children(title='',control_type='Pane')[0].children(title='',control_type='Pane')[1].children(title='',control_type='Pane')[0].children(title='',control_type='Pane')[0].children(title='',control_type='Pane')[0].children(title='',control_type='Pane')[0].children(title='',control_type='Pane')[0].children(title='',control_type='Pane')[0]
-                base_info=base_info_pane.descendants(control_type='Text')
+                profile_ocr_result,base_info=_inspect_wechat_profile(base_info_pane,main_window)
                 base_info=[element.window_text() for element in base_info]
                 # #如果有昵称选项,说明好友有备注
                 if language=='简体中文':
@@ -5065,17 +5066,19 @@ class Contacts():
         ######################################################################
         nicknames=[] 
         remarks=[]
+        ocr_results=[]
         #初始化微信号列表为最后一个好友的微信号与任意字符,至于为什么要填充任意字符，自己想想
         wechatnumbers=[last_member_info['wechatnumber'],'nothing']
+        traversal_ids=[last_member_info['wechatnumber'],'nothing']
         #核心思路，一直比较存放所有好友微信号列表的首个元素和最后一个元素是否相同，
         #当记录到最后一个好友时,列表首位元素相同,此时结束while循环,while循环内是一直按下down健，记录右侧变换
         #的好友信息面板内的好友信息
-        while wechatnumbers[-1]!=wechatnumbers[0]:
+        while traversal_ids[-1]!=traversal_ids[0]:
             pyautogui.keyDown('down',_pause=False)
             time.sleep(0.01)
             #这里将get_info内容提取出来重复是因为，这样会加快速度，若在while循环内部直接调用get_info函数，会导致速度变慢
             try: #通讯录界面右侧的好友信息面板  
-                base_info=base_info_pane.descendants(control_type='Text')
+                profile_ocr_result,base_info=_inspect_wechat_profile(base_info_pane,main_window)
                 base_info=[element.window_text() for element in base_info]
                 # #如果有昵称选项,说明好友有备注s
                 if language=='简体中文':
@@ -5089,7 +5092,9 @@ class Contacts():
                         wechatnumber=base_info[2]
                     nicknames.append(nickname)
                     remarks.append(remark)
-                    wechatnumbers.append(wechatnumber) 
+                    traversal_ids.append(wechatnumber)
+                    ocr_results.append(profile_ocr_result)
+                    wechatnumbers.append(profile_ocr_result.value if profile_ocr_result.is_confirmed else '无')
                 if language=='英文':
                     if base_info[1]=='Name: ':
                         remark=base_info[0]
@@ -5101,7 +5106,9 @@ class Contacts():
                         wechatnumber=base_info[2]
                     nicknames.append(nickname)
                     remarks.append(remark)
-                    wechatnumbers.append(wechatnumber)
+                    traversal_ids.append(wechatnumber)
+                    ocr_results.append(profile_ocr_result)
+                    wechatnumbers.append(profile_ocr_result.value if profile_ocr_result.is_confirmed else '无')
 
                 if language=='繁体中文':
                     if base_info[1]=='暱稱: ':
@@ -5114,7 +5121,9 @@ class Contacts():
                         wechatnumber=base_info[2]
                     nicknames.append(nickname)
                     remarks.append(remark)
-                    wechatnumbers.append(wechatnumber)      
+                    traversal_ids.append(wechatnumber)
+                    ocr_results.append(profile_ocr_result)
+                    wechatnumbers.append(profile_ocr_result.value if profile_ocr_result.is_confirmed else '无')
             except IndexError:
                 pass
         #删除一开始存放在起始位置的最后一个好友的微信号,不然重复了
@@ -5123,8 +5132,11 @@ class Contacts():
         del(wechatnumbers[0])
         ##########################################
         #转为json格式
-        records=zip(nicknames,remarks,wechatnumbers)
-        contacts=[{'昵称':name[0],'备注':name[1],'微信号':name[2]} for name in records]
+        records=zip(nicknames,remarks,wechatnumbers,ocr_results)
+        contacts=[{'昵称':name[0],'备注':name[1],'微信号':name[2],
+                   '微信号状态':name[3].status,'微信号来源':name[3].source,
+                   '微信号置信度':name[3].confidence or '无','微信号原因':name[3].reason or '无',
+                   '微信号候选':name[3].value or '无'} for name in records]
         if is_json:
             contacts=json.dumps(contacts,ensure_ascii=False,separators=(',', ':'),indent=2)
         ##############################################################
@@ -5177,7 +5189,7 @@ class Contacts():
                     base_info_pane=main_window.children(title='',control_type='Pane')[1].children(title='',control_type='Pane')[0].children(title='',control_type='Pane')[1].children(title='',control_type='Pane')[0].children(title='',control_type='Pane')[0].children(title='',control_type='Pane')[0].children(title='',control_type='Pane')[0].children(title='',control_type='Pane')[0].children(title='',control_type='Pane')[0]
                 except IndexError:
                     base_info_pane=main_window.children(title='',control_type='Pane')[0].children(title='',control_type='Pane')[0].children(title='',control_type='Pane')[1].children(title='',control_type='Pane')[0].children(title='',control_type='Pane')[0].children(title='',control_type='Pane')[0].children(title='',control_type='Pane')[0].children(title='',control_type='Pane')[0].children(title='',control_type='Pane')[0]
-                base_info=base_info_pane.descendants(control_type='Text')
+                profile_ocr_result,base_info=_inspect_wechat_profile(base_info_pane,main_window)
                 base_info=[element.window_text() for element in base_info]
                 # #如果有昵称选项,说明好友有备注
                 if language=='简体中文':
@@ -5346,6 +5358,7 @@ class Contacts():
         ######################################################################
         #初始化微信号列表为最后一个好友的微信号与任意字符,至于为什么要填充任意字符，自己想想
         wechatnumbers=[last_member_info['wechatnumber'],'nothing']
+        traversal_ids=[last_member_info['wechatnumber'],'nothing']
         nicknames=[]
         remarks=[]
         tags=[]
@@ -5356,14 +5369,15 @@ class Contacts():
         descrptions=[]
         signatures=[]
         sources=[]
+        ocr_results=[]
         #核心思路，一直比较存放所有好友微信号列表的首个元素和最后一个元素是否相同，
         #当记录到最后一个好友时,列表首末元素相同,此时结束while循环,while循环内是一直按下down健，记录右侧变换
         #的好友信息面板内的好友信息
-        while wechatnumbers[-1]!=wechatnumbers[0]:
+        while traversal_ids[-1]!=traversal_ids[0]:
             pyautogui.keyDown('down',_pause=False)
             time.sleep(0.01)
             try: #通讯录界面右侧的好友信息面板   
-                base_info=base_info_pane.descendants(control_type='Text')
+                profile_ocr_result,base_info=_inspect_wechat_profile(base_info_pane,main_window)
                 base_info=[element.window_text() for element in base_info]
                 # #如果有昵称选项,说明好友有备注
                 if language=='简体中文':
@@ -5421,7 +5435,9 @@ class Contacts():
                         descrption='无'
                     nicknames.append(nickname)
                     remarks.append(remark)
-                    wechatnumbers.append(wechatnumber)
+                    traversal_ids.append(wechatnumber)
+                    ocr_results.append(profile_ocr_result)
+                    wechatnumbers.append(profile_ocr_result.value if profile_ocr_result.is_confirmed else '无')
                     regions.append(region)
                     tags.append(tag)
                     common_group_nums.append(common_group_num)
@@ -5486,7 +5502,9 @@ class Contacts():
                         descrption='无'
                     nicknames.append(nickname)
                     remarks.append(remark)
-                    wechatnumbers.append(wechatnumber)
+                    traversal_ids.append(wechatnumber)
+                    ocr_results.append(profile_ocr_result)
+                    wechatnumbers.append(profile_ocr_result.value if profile_ocr_result.is_confirmed else '无')
                     regions.append(region)
                     tags.append(tag)
                     common_group_nums.append(common_group_num)
@@ -5551,7 +5569,9 @@ class Contacts():
                         descrption='无'
                     nicknames.append(nickname)
                     remarks.append(remark)
-                    wechatnumbers.append(wechatnumber)
+                    traversal_ids.append(wechatnumber)
+                    ocr_results.append(profile_ocr_result)
+                    wechatnumbers.append(profile_ocr_result.value if profile_ocr_result.is_confirmed else '无')
                     regions.append(region)
                     tags.append(tag)
                     common_group_nums.append(common_group_num)
@@ -5569,8 +5589,11 @@ class Contacts():
         del(wechatnumbers[0])
         ##########################################
         #转为json格式
-        records=zip(nicknames,wechatnumbers,regions,remarks,phonenumbers,tags,descrptions,permissions,common_group_nums,signatures,sources)
-        contacts=[{'昵称':name[0],'微信号':name[1],'地区':name[2],'备注':name[3],'电话':name[4],'标签':name[5],'描述':name[6],'朋友权限':name[7],'共同群聊':name[8],'个性签名':name[9],'来源':name[10]} for name in records]
+        records=zip(nicknames,wechatnumbers,regions,remarks,phonenumbers,tags,descrptions,permissions,common_group_nums,signatures,sources,ocr_results)
+        contacts=[{'昵称':name[0],'微信号':name[1],'地区':name[2],'备注':name[3],'电话':name[4],'标签':name[5],'描述':name[6],'朋友权限':name[7],'共同群聊':name[8],'个性签名':name[9],'来源':name[10],
+                   '微信号状态':name[11].status,'微信号来源':name[11].source,
+                   '微信号置信度':name[11].confidence or '无','微信号原因':name[11].reason or '无',
+                   '微信号候选':name[11].value or '无'} for name in records]
         if is_json:
             contacts=json.dumps(contacts,ensure_ascii=False,separators=(',', ':'),indent=2)#ensure_ascii必须为False
         ##############################################################

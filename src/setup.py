@@ -13,7 +13,7 @@ long_description=open('README.md','r',encoding='utf-8').read(),
 long_description_content_type='text/markdown',  
 url='https://github.com/Hello-Mr-Crab/pywechat',
 #64位操作系统都安装,32位操作系统只安装pywechat
-packages=['pywechat','pyweixin','pyweixin.ocr'] if sys.maxsize==2**63-1 else ['pywechat'],
+packages=['pywechat','pyweixin','pyweixin.ocr','wechat_ocr'],
 license='LGPL',
 keywords=['rpa','windows','wechat','automation'],
 install_requires=[

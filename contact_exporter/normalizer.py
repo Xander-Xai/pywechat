@@ -9,8 +9,10 @@ Responsibilities:
 
 from __future__ import annotations
 
-import re
 from typing import Any
+
+from wechat_ocr.config import DEFAULT_CONFIG
+from wechat_ocr.validator import validate_wechat_id
 
 from .models import Contact, EMPTY_SENTINELS, EXPORT_FIELDS, KEY_MAP
 
@@ -34,8 +36,9 @@ def normalize_one(raw: dict[str, Any], exported_at: str) -> Contact:
             fields[en_key] = _clean(raw[cn_key])
     # Fail closed at the export boundary too: a raw legacy value with no
     # explicit CONFIRMED receipt can never populate the canonical column.
-    if fields.get("wechat_id_status") != "CONFIRMED" or not re.fullmatch(
-        r"[A-Za-z][A-Za-z0-9_-]{5,19}", fields.get("wechat_id", "")
+    if (
+        fields.get("wechat_id_status") != "CONFIRMED"
+        or not validate_wechat_id(fields.get("wechat_id", ""), DEFAULT_CONFIG).valid
     ):
         fields["wechat_id_candidate"] = fields.get("wechat_id_candidate") or fields.get(
             "wechat_id", ""
