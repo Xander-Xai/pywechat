@@ -3,16 +3,15 @@
 Every threshold lives here so that none of them are magic numbers buried in
 the extraction logic.
 
-Initial threshold basis: the local synthetic two-view smoke read the known
-candidate at 0.9998. The 0.99 threshold leaves margin below that one reading,
-but is not calibrated against a representative real-profile dataset.
-Confidence alone never confirms a value; both views must agree and syntax
-must pass. Retest before changing this threshold.
+The 0.99 threshold is conservative but not statistically calibrated against
+a representative real-profile dataset. A synthetic probe is not a calibration
+basis. Confidence alone never confirms a value; both views must agree and
+syntax must pass. Retest before changing this threshold.
 
-The default is PP-OCRv6 medium detection and recognition, as the target is a
-small, high-value identifier. Do not silently change to a smaller model to
-improve speed; measure the target Windows workload and make any tradeoff
-explicit.
+The default is PP-OCRv6 small detection and medium recognition. The
+recognizer handles the high-value identifier; the small detector locates the
+label and value efficiently. A medium detector remains available by explicit
+configuration.
 """
 
 from __future__ import annotations
@@ -62,7 +61,7 @@ class WeChatIdOcrConfig:
 
     # --- model ------------------------------------------------------------
     ocr_version: str = "PP-OCRv6"
-    det_model_type: str = "medium"
+    det_model_type: str = "small"
     rec_model_type: str = "medium"
     # ONNX Runtime defaults to one thread per core, which on a many-core
     # machine thrashes on small inputs: the medium detector took 91s with

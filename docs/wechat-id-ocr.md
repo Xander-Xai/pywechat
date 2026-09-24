@@ -30,9 +30,8 @@ on the same line to the right, or close below the label. Other ID-like text
 on the page is ignored. Values are never concatenated across OCR boxes.
 
 Only agreement between two views with a confidence at or above the configured
-`0.99` threshold confirms OCR alone. This initial threshold sits below the
-`0.9998` reading from the local synthetic probe, but it is not calibrated
-against a representative labeled set of real WeChat profiles. Matching UIA can
+`0.99` threshold confirms OCR alone. The threshold is not calibrated against a
+representative labeled set of real WeChat profiles. Matching UIA can
 confirm an otherwise agreeing low-confidence OCR result. Different OCR views,
 OCR/UIA disagreement, UIA-only results, missing values, invalid syntax, or
 failed OCR never fill the export `wechat_id` column. No O/0, I/l/1, S/5,
@@ -59,10 +58,12 @@ the CPU path. RapidOCR currently brings `opencv-python` as a declared transitive
 dependency; the project does not import or use OpenCV directly. PaddlePaddle,
 PyTorch, CUDA, Windows.Media.Ocr, and cloud OCR are not used.
 
-The default is PP-OCRv6 medium detector + medium recognizer. The model source
+The default is PP-OCRv6 small detector + medium recognizer. A medium detector
+can be selected explicitly through `WeChatIdOcrConfig(det_model_type="medium")`.
+The model source
 is the RapidAI v3.9.2 ONNX release on ModelScope:
 
-- [PP-OCRv6 medium detector](https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.9.2/onnx/PP-OCRv6/det/PP-OCRv6_det_medium.onnx) — SHA256 `92078b7355007ccfffcd4c8cd441a3afd4538904d06881b29a155e1e679907c2`
+- [PP-OCRv6 small detector](https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.9.2/onnx/PP-OCRv6/det/PP-OCRv6_det_small.onnx) — SHA256 `090f04abcd9d9a7498bc4ebf677e4cb9bdce1fe4197ddb7e529f1ef44e1ff94f`
 - [PP-OCRv6 medium recognizer](https://www.modelscope.cn/models/RapidAI/RapidOCR/resolve/v3.9.2/onnx/PP-OCRv6/rec/PP-OCRv6_rec_medium.onnx) — SHA256 `eef444829dbbe18d7fea59a3f6eb75647518d2b3a9568d27c92e42940204894b`
 
 These hashes are RapidOCR 3.9.2's published model manifest values and match
@@ -92,18 +93,24 @@ in memory only (not saved).
 
 ## Performance and limitations
 
-Local benchmark (2026-09-25, Windows, Python 3.13, 20 logical processors,
-700×420 synthetic profile image; models already present and hash-validated):
+Local synthetic benchmark (2026-09-25, Windows, Python 3.13, 20 logical
+processors, 700×420 generated profile-like image; models already present and
+hash-validated; small detector + medium recognizer):
 
 | Metric | Measured |
 | --- | ---: |
-| Medium det + rec model construction | 1.204 s |
-| Cold process, load + two-view extraction | 21.022 s |
-| Warm view A / view B | 10.345 s / 9.738 s |
-| Warm two-view total | 19.940 s |
-| Process CPU during warm extraction | 84.734 CPU-s (424.9%, about 4.25 logical cores) |
-| RSS after model load / after extraction | 268.6 MiB / 276.7 MiB |
-| Synthetic candidate confidence | 0.9998 in both views |
+| Model construction | 0.925 s |
+| Cold start: construction + first view | 2.501 s |
+| Warm single view | 1.419 s |
+| Warm two-view extraction | 2.879 s |
+| Process CPU during warm two-view extraction | 17.828 CPU-s |
+| RSS after model load / after extraction | 220.8 MiB / 275.8 MiB |
+| Synthetic confidence / view agreement | 0.99998 / agree |
+
+The previous medium-detector + medium-recognizer run on a generated 700×420
+image measured 19.940 s warm dual-view, 84.734 CPU-s, and 276.7 MiB RSS after
+extraction. The small-detector run is substantially faster on this synthetic
+case; this is not evidence of real-contact accuracy or a threshold calibration.
 
 Performance should be measured on the target Windows host after model warmup.
 This synthetic probe validates that the pinned stack runs but is not a

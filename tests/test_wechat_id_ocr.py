@@ -6,6 +6,7 @@ from pyweixin.ocr.config import WeChatIdOcrConfig
 from pyweixin.ocr.engine import (
     OcrEngine,
     OcrToken,
+    _build_params,
     get_ocr_engine,
     reset_ocr_engine_cache,
 )
@@ -20,6 +21,7 @@ from pyweixin.ocr.wechat_id import (
 from pyweixin.ocr.validator import normalize_candidate, validate_wechat_id
 from pyweixin.ocr.roi import fallback_profile_roi
 from pyweixin.ocr import capture
+from pyweixin.ocr.masking import mask_wechat_id
 
 
 def token(text, x, y=10, confidence=0.99, width=60, height=16):
@@ -256,3 +258,26 @@ def test_profile_capture_uses_accessible_rectangle(monkeypatch):
     capture.capture_profile_image(Window(), Window())
     assert seen["bbox"] == (10, 20, 310, 220)
     assert seen["all_screens"] is True
+
+
+def test_default_model_is_small_detector_and_medium_recognizer():
+    from pyweixin.ocr.config import DEFAULT_CONFIG
+
+    assert DEFAULT_CONFIG.det_model_type == "small"
+    assert DEFAULT_CONFIG.rec_model_type == "medium"
+    params = _build_params(DEFAULT_CONFIG)
+    assert params["Det.model_type"].value == "small"
+    assert params["Rec.model_type"].value == "medium"
+
+
+def test_medium_detector_requires_explicit_configuration():
+    config = WeChatIdOcrConfig(det_model_type="medium")
+    params = _build_params(config)
+    assert params["Det.model_type"].value == "medium"
+    assert params["Rec.model_type"].value == "medium"
+
+
+def test_wechat_id_masking_never_emits_the_full_identifier():
+    assert mask_wechat_id("wechat123") == "we***23"
+    assert mask_wechat_id("abc") == "***"
+    assert mask_wechat_id(None) == ""

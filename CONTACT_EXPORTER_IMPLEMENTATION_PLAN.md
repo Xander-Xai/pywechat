@@ -87,14 +87,10 @@ pyweixin get_friends_detail 的 dict 键（缺失字段值为 '无'）：
 `Navigator.open_weixin` 找不到 mmui::MainWindow 时 raise `NotFoundError`。根因（README/Weixin4.0.md）：微信 4.1+ 收紧了无障碍策略，只有使用过无障碍模式（讲述人）的账号 UI 树才可见；从未使用过的新号无法通过 UI Automation 读取（官方推荐 OCR RPA）。这是上游项目本身的硬性限制，导出工具需透明传播并在报错中给出可执行提示。
 
 ### 1.8 是否需要逐联系人打开资料页？
-不是。get_friends_detail 的实现：
-1. Navigator.open_contacts() 打开通讯录面板（主窗口内）。
-2. 点击联系人分区，click_input() 选中第一个好友。
-3. for 循环内 pyautogui.keyDown('down') 逐个移动选中项，同时读取右侧常驻详情面板（ContactProfileGroup / auto_id=contact_profile_view）文本。
-即：主窗口内的列表选中 + 右侧面板读取，不打开独立窗口、不进入编辑态。
+不是。get_friends_detail 在主窗口内选中联系人，读取右侧常驻资料面板截图并运行 OCR；UIA 文本只在 OCR 后用于交叉校验。它不打开独立窗口，也不进入编辑态。
 
 ### 1.9 当前实现是否会执行任何微信侧写操作？
-不会。get_friends_detail 全程只做：窗口定位/置前、点击通讯录入口、键盘导航（DOWN）、读取 UI 文本、按参数关闭窗口。无发消息/加好友/改备注/拉群/朋友圈/资料编辑。close_weixin 默认 False，不会关闭用户微信。且 get_friends_detail 本身不调用 Tools.get_current_wxid()，不读取进程内存映射、不触碰微信数据库。
+不会。get_friends_detail 全程只做：窗口定位/置前、点击通讯录入口、键盘导航（DOWN）、读取资料截图/UIA 文本、按参数关闭窗口。无发消息/加好友/改备注/拉群/朋友圈/资料编辑。close_weixin 默认 False，不会关闭用户微信。且 get_friends_detail 本身不调用 Tools.get_current_wxid()，不读取进程内存映射、不触碰微信数据库。
 
 ### 1.10 当前实现对微信版本有什么限制？
 - pyweixin：微信 4.1.6+；部分 UI 分支按 GlobalConfig.Version >= 4.1.12 切换；Windows 10/11。
