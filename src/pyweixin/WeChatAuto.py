@@ -1220,6 +1220,31 @@ class Contacts():
         }  # 联系人分区的标签
         # 通讯录列表
         contact_list, main_window = Navigator.open_contacts(is_maximize=is_maximize)
+        if getattr(contact_list, "visual_navigation", False):
+            # The screenshot/OCR navigation path is deliberately bounded to
+            # the requested read-only smoke size and does not log PII.
+            friends_detail = contact_list.read_contacts(max_contacts=5)
+            for info in friends_detail:
+                info.update(
+                    {
+                        "地区": "无",
+                        "备注": "无",
+                        "电话": "无",
+                        "标签": "无",
+                        "描述": "无",
+                        "朋友权限": "无",
+                        "共同群聊": "无",
+                        "个性签名": "无",
+                        "来源": "无",
+                    }
+                )
+            if is_json:
+                friends_detail = json.dumps(
+                    obj=friends_detail, ensure_ascii=False, indent=2
+                )
+            if close_weixin:
+                main_window.close()
+            return friends_detail
         # 右侧的自定义面板
         try:
             contact_custom = main_window.child_window(**Customs.ContactDetailCustom)
