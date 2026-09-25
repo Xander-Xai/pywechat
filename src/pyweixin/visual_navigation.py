@@ -11,7 +11,7 @@ import hashlib
 import time
 from typing import Callable, Iterable, Sequence
 
-from PIL import Image, ImageFilter, ImageStat
+from PIL import Image, ImageChops, ImageFilter, ImageStat
 
 
 WINDOW_NOT_FOUND = "WINDOW_NOT_FOUND"
@@ -21,6 +21,11 @@ CONTACTS_PAGE_NOT_CONFIRMED = "CONTACTS_PAGE_NOT_CONFIRMED"
 CONTACT_LIST_NOT_FOUND = "CONTACT_LIST_NOT_FOUND"
 CONTACT_PROFILE_NOT_FOUND = "CONTACT_PROFILE_NOT_FOUND"
 OCR_FAILED = "OCR_FAILED"
+PROFILE_NOT_STABLE = "PROFILE_NOT_STABLE"
+
+PROFILE_STABLE_WAIT_MS = 300
+PROFILE_STABLE_TIMEOUT_MS = 5000
+PROFILE_STABLE_MEAN_DIFF = 1.4
 
 CONTACTS_NAV_ANCHOR = "CONTACTS_NAV_ANCHOR"
 CONTACTS_NAV_REGION = (0.0, 0.19, 0.105, 0.40)
@@ -551,8 +556,11 @@ class Win32VisualNavigation:
     def contact_rows(self, *, page_verified: bool) -> list[float]:
         if not page_verified:
             raise NavigationFailure(CONTACTS_PAGE_NOT_CONFIRMED)
+        started = time.perf_counter()
         image = self._screenshot(self.hwnd)
-        return detect_contact_rows(self._tokens(image), image.size)
+        rows = detect_contact_rows(self._tokens(image), image.size)
+        self.last_contact_row_detect_seconds = time.perf_counter() - started
+        return rows
 
     def select_contact(
         self,
@@ -566,6 +574,7 @@ class Win32VisualNavigation:
             raise NavigationFailure(
                 CONTACT_LIST_NOT_FOUND, "contact index exceeds read-only smoke bound"
             )
+        row_detection_started = time.perf_counter()
         rows = self.contact_rows(page_verified=page_verified)
         if contact_index > len(rows):
             raise NavigationFailure(CONTACT_LIST_NOT_FOUND)
@@ -575,6 +584,7 @@ class Win32VisualNavigation:
         # Fresh screenshot and OCR row revalidation before a single click.
         fresh = self._screenshot(self.hwnd)
         fresh_rows = detect_contact_rows(self._tokens(fresh), fresh.size)
+        row_detection_seconds = time.perf_counter() - row_detection_started
         if (
             len(fresh_rows) < contact_index
             or abs(fresh_rows[contact_index - 1] - y_ratio) > 0.025
@@ -583,25 +593,68 @@ class Win32VisualNavigation:
                 NAVIGATION_UNRESOLVED, "contact row shifted before click"
             )
         point = self._validate_click(x_ratio, y_ratio, region)
+        click_started = time.perf_counter()
         self._click(*point)
-        self._wait(0.8)
-        selected = self._screenshot(self.hwnd)
+        click_latency = time.perf_counter() - click_started
+        selected, stability_latency = self.wait_profile_stable()
         if image_fingerprint(selected) == image_fingerprint(fresh):
             raise NavigationFailure(
                 CONTACT_PROFILE_NOT_FOUND, "profile view did not change"
             )
+        self.last_profile_stability_seconds = stability_latency
+        self.last_contact_timing = {
+            "contact_row_detect": row_detection_seconds,
+            "contact_click": click_latency,
+            "profile_stability_wait": stability_latency,
+        }
         return y_ratio
+
+    def wait_profile_stable(self) -> tuple[Image.Image, float]:
+        """Poll in-memory right-panel frames until two consecutive deltas settle."""
+        started = time.perf_counter()
+        deadline = started + PROFILE_STABLE_TIMEOUT_MS / 1000
+        previous = None
+        consecutive_stable = 0
+        current = self._screenshot(self.hwnd)
+        while time.perf_counter() < deadline:
+            self._wait(PROFILE_STABLE_WAIT_MS / 1000)
+            current = self._screenshot(self.hwnd)
+            if previous is not None:
+                width, height = current.size
+                box = (
+                    round(PROFILE_FALLBACK_REGION[0] * width),
+                    round(PROFILE_FALLBACK_REGION[1] * height),
+                    round(PROFILE_FALLBACK_REGION[2] * width),
+                    round(PROFILE_FALLBACK_REGION[3] * height),
+                )
+                old = previous.crop(box).convert("L")
+                new = current.crop(box).convert("L")
+                mean_diff = ImageStat.Stat(ImageChops.difference(old, new)).mean[0]
+                consecutive_stable = (
+                    consecutive_stable + 1
+                    if mean_diff <= PROFILE_STABLE_MEAN_DIFF
+                    else 0
+                )
+                if consecutive_stable >= 2:
+                    self.last_stable_frame = current
+                    return current, time.perf_counter() - started
+            previous = current
+        raise NavigationFailure(
+            PROFILE_NOT_STABLE,
+            f"profile ROI did not settle within {PROFILE_STABLE_TIMEOUT_MS}ms",
+        )
 
     def profile_image(
         self,
         *,
         page_verified: bool,
         uia_rect: tuple[int, int, int, int] | None = None,
+        image: Image.Image | None = None,
     ) -> tuple[Image.Image, float]:
         if not page_verified:
             raise NavigationFailure(CONTACTS_PAGE_NOT_CONFIRMED)
         started = time.perf_counter()
-        image = self._screenshot(self.hwnd)
+        image = image if image is not None else self._screenshot(self.hwnd)
         width, height = image.size
         box = None
         if uia_rect:
@@ -658,24 +711,122 @@ class Win32VisualNavigation:
             raise NavigationFailure(CONTACT_PROFILE_NOT_FOUND)
         return crop, time.perf_counter() - started
 
+    def profile_rois(
+        self, image: Image.Image | None = None
+    ) -> tuple[dict[str, Image.Image], float]:
+        """Return bounded A/B/C profile regions from one in-memory frame."""
+        started = time.perf_counter()
+        frame = image or self._screenshot(self.hwnd)
+        width, height = frame.size
+        normalized = {
+            "original": (0.43, 0.035, 0.995, 0.94),
+            "expanded": (0.37, 0.015, 0.999, 0.98),
+            "right_panel": (0.34, 0.0, 1.0, 1.0),
+        }
+        crops = {
+            name: frame.crop(
+                (
+                    round(left_ratio * width),
+                    round(top_ratio * height),
+                    round(right_ratio * width),
+                    round(bottom_ratio * height),
+                )
+            )
+            for name, (
+                left_ratio,
+                top_ratio,
+                right_ratio,
+                bottom_ratio,
+            ) in normalized.items()
+        }
+        return crops, time.perf_counter() - started
+
     def extract_selected_profile(
         self,
         *,
         page_verified: bool,
         uia_rect: tuple[int, int, int, int] | None = None,
+        uia_candidate: str | None = None,
     ):
         """Capture the profile ROI and call the existing shared ID extractor."""
-        from wechat_ocr import DEFAULT_CONFIG, WeChatIdExtractor
-        from wechat_ocr.extractor import reconcile_ocr_result
+        import json
+        import os
 
+        from wechat_ocr import DEFAULT_CONFIG, WeChatIdExtractor
+        from wechat_ocr.extractor import diagnose_profile_rois, reconcile_ocr_result
+
+        frame = getattr(self, "last_stable_frame", None)
         image, capture_latency = self.profile_image(
-            page_verified=page_verified, uia_rect=uia_rect
+            page_verified=page_verified, uia_rect=uia_rect, image=frame
         )
+        rois, roi_latency = self.profile_rois(image=frame)
+        benchmark_started = time.perf_counter()
+        run_benchmark = not getattr(self, "multiscale_benchmark_complete", False)
+        benchmark = diagnose_profile_rois(rois) if run_benchmark else None
+        if run_benchmark:
+            self.multiscale_benchmark_complete = True
+            benchmark_latency = time.perf_counter() - benchmark_started
+            self.last_roi_diagnostics = benchmark
+        else:
+            benchmark_latency = 0.0
+
+        def score(item):
+            scales = item["scales"]
+            scale_two = scales["2"]
+            label_count = sum(scale_two["has_wechat_label"])
+            candidate_count = sum(scale_two["candidate_valid"])
+            token_count = sum(scale_two["recognized_token_count"])
+            return candidate_count, label_count, token_count
+
+        if benchmark is not None:
+            selected_roi = max(rois, key=lambda key: score(benchmark[key]))
+            if score(benchmark[selected_roi])[0] == 0:
+                selected_roi = "original"
+        else:
+            selected_roi = getattr(self, "last_selected_roi", "original")
+        self.last_selected_roi = selected_roi
+        selected_image = rois[selected_roi]
+        if (
+            benchmark is not None
+            and os.getenv("WECHAT_OCR_DIAGNOSTIC", "false").casefold() == "true"
+        ):
+            print(
+                "WECHAT_OCR_DIAGNOSTIC "
+                + json.dumps(
+                    {
+                        "roi_benchmark": benchmark,
+                        "selected_roi": selected_roi,
+                        "profile_stability_seconds": getattr(
+                            self, "last_profile_stability_seconds", None
+                        ),
+                    },
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+            )
         started = time.perf_counter()
-        ocr = WeChatIdExtractor(config=DEFAULT_CONFIG).extract(image)
+        ocr = WeChatIdExtractor(config=DEFAULT_CONFIG).extract(selected_image)
         ocr_latency = time.perf_counter() - started
+        ocr.view_diagnostics.append(
+            {
+                "roi_original_width": image.width,
+                "roi_original_height": image.height,
+                "selected_roi": selected_roi,
+                "roi_latency_seconds": roi_latency,
+                "multiscale_latency_seconds": benchmark_latency,
+                "profile_stability_seconds": getattr(
+                    self, "last_profile_stability_seconds", None
+                ),
+            }
+        )
+        self.last_timing = {
+            "profile_capture": capture_latency,
+            "roi": roi_latency,
+            "multiscale": benchmark_latency,
+            "ocr_dual_view": ocr_latency,
+        }
         # UIA remains optional and is only read after the OCR result exists.
-        return reconcile_ocr_result(ocr, None), capture_latency, ocr_latency
+        return reconcile_ocr_result(ocr, uia_candidate), capture_latency, ocr_latency
 
 
 def image_fingerprint(image: Image.Image) -> str:
@@ -688,18 +839,42 @@ class VisualContactSession:
 
     visual_navigation = True
 
-    def __init__(self, navigator: Win32VisualNavigation, page_evidence: PageEvidence):
+    def __init__(
+        self,
+        navigator: Win32VisualNavigation,
+        page_evidence: PageEvidence,
+        uia_window=None,
+    ):
         self.navigator = navigator
         self.page_evidence = page_evidence
+        self.uia_window = uia_window
 
-    def read_contacts(self, max_contacts: int = 5) -> list[dict[str, object]]:
-        if not 1 <= max_contacts <= 5:
+    def _uia_candidate(self) -> str | None:
+        if self.uia_window is None:
+            return None
+        try:
+            from wechat_ocr import extract_wechat_id_from_uia
+
+            texts = [
+                element.window_text()
+                for element in self.uia_window.descendants(control_type="Text")
+            ]
+            return extract_wechat_id_from_uia(texts)
+        except Exception:
+            return None
+
+    def read_contacts(
+        self, max_contacts: int = 5, start_index: int = 1
+    ) -> list[dict[str, object]]:
+        if not 1 <= max_contacts <= 5 or not 1 <= start_index <= max_contacts:
             raise ValueError("visual read-only smoke is limited to 1..5 contacts")
+        row_started = time.perf_counter()
         rows = self.navigator.contact_rows(page_verified=self.page_evidence.confirmed)
+        row_latency = time.perf_counter() - row_started
         if not rows:
             raise NavigationFailure(CONTACT_LIST_NOT_FOUND)
         results = []
-        for contact_index in range(1, min(max_contacts, len(rows)) + 1):
+        for contact_index in range(start_index, min(max_contacts, len(rows)) + 1):
             contact_started = time.perf_counter()
             self.navigator.select_contact(
                 contact_index,
@@ -708,8 +883,48 @@ class VisualContactSession:
             )
             result, capture_latency, ocr_latency = (
                 self.navigator.extract_selected_profile(
-                    page_verified=self.page_evidence.confirmed
+                    page_verified=self.page_evidence.confirmed,
+                    uia_candidate=self._uia_candidate(),
                 )
+            )
+            roi_data = getattr(self.navigator, "last_roi_diagnostics", {})
+            selected_roi = getattr(self.navigator, "last_selected_roi", "original")
+            roi_stats = roi_data.get(selected_roi, {}).get("scales", {}).get("2", {})
+            if not roi_stats:
+                roi_stats = {
+                    "detected_box_count": [
+                        item.get("detected_box_count", 0)
+                        for item in result.view_diagnostics[:2]
+                    ],
+                    "recognized_token_count": [
+                        item.get("recognized_token_count", 0)
+                        for item in result.view_diagnostics[:2]
+                    ],
+                    "has_wechat_label": [
+                        item.get("has_wechat_label", False)
+                        for item in result.view_diagnostics[:2]
+                    ],
+                    "candidate_found": [
+                        item.get("candidate_found", False)
+                        for item in result.view_diagnostics[:2]
+                    ],
+                }
+            profile_status = result.status
+            contact_total = (
+                self.page_evidence.latency_seconds
+                + row_latency
+                + time.perf_counter()
+                - contact_started
+            )
+            stage_timing = {
+                **getattr(self.navigator, "last_contact_timing", {}),
+                **getattr(self.navigator, "last_timing", {}),
+                "total": contact_total,
+            }
+            stage_timing["contacts_page_verified"] = self.page_evidence.latency_seconds
+            stage_timing["initial_contact_row_detect"] = row_latency
+            accounted = sum(
+                value for key, value in stage_timing.items() if key != "total"
             )
             results.append(
                 {
@@ -719,7 +934,7 @@ class VisualContactSession:
                     "navigation_latency_seconds": self.page_evidence.latency_seconds,
                     "profile_found": True,
                     "微信号": result.value if result.is_confirmed else "无",
-                    "微信号状态": result.status,
+                    "微信号状态": profile_status,
                     "微信号来源": result.source,
                     "微信号置信度": result.confidence,
                     "微信号原因": result.reason or "",
@@ -727,19 +942,30 @@ class VisualContactSession:
                     "ocr_found": any(result.ocr_candidates),
                     "uia_found": result.ui_candidate is not None,
                     "agreement": (
-                        "match"
-                        if result.ui_candidate == result.value
-                        else "unavailable"
+                        "unavailable"
                         if result.ui_candidate is None
+                        else "match"
+                        if result.ui_candidate == result.value
                         else "mismatch"
                     ),
                     "capture_latency_seconds": capture_latency,
                     "ocr_latency_seconds": ocr_latency,
-                    "total_latency_seconds": (
-                        self.page_evidence.latency_seconds
-                        + time.perf_counter()
-                        - contact_started
+                    "profile_stable": bool(
+                        getattr(self.navigator, "last_profile_stability_seconds", None)
+                        is not None
                     ),
+                    "roi_strategy": selected_roi,
+                    "detected_boxes": sum(roi_stats.get("detected_box_count", [])),
+                    "recognized_tokens": sum(
+                        roi_stats.get("recognized_token_count", [])
+                    ),
+                    "wechat_label_found": any(roi_stats.get("has_wechat_label", [])),
+                    "candidate_found": any(roi_stats.get("candidate_found", [])),
+                    "candidate_masked": "<MASKED>" if result.value else "",
+                    "failure_stage": result.reason or profile_status,
+                    "stage_timing_seconds": stage_timing,
+                    "unexplained_time_seconds": max(0.0, contact_total - accounted),
+                    "total_latency_seconds": contact_total,
                 }
             )
         return results

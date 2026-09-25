@@ -1192,7 +1192,9 @@ class Navigator():
 
         try:
             evidence=navigator.confirm_current_contacts(uia_list_hint=uia_list_hint)
-            return VisualContactSession(navigator,evidence),main_window
+            return VisualContactSession(
+                navigator, evidence, uia_window=main_window
+            ), main_window
         except NavigationFailure:
             pass
 
@@ -1203,7 +1205,9 @@ class Navigator():
             uia_hint=uia_contacts_hint,
             uia_list_hint=uia_list_hint,
         )
-        return VisualContactSession(navigator,evidence),main_window
+        return VisualContactSession(
+            navigator, evidence, uia_window=main_window
+        ), main_window
 
     @staticmethod
     def open_contacts_manage(is_maximize:bool=None,window_maximize:bool=None,close_weixin:bool=None)->WindowSpecification:

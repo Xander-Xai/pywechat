@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from PIL import Image
+import pytest
 
 from pyweixin.ocr.config import WeChatIdOcrConfig
 from pyweixin.ocr.engine import (
@@ -132,6 +133,98 @@ def test_label_without_value_and_multiple_ids_never_guess():
         token("other123", 65),
     ]
     assert candidate_near_label(tokens) == (None, None)
+
+
+def test_label_normalization_preserves_merged_id_suffix():
+    assert (
+        candidate_near_label([token("微信号：abc_123", 0, width=120)])[0] == "abc_123"
+    )
+    assert (
+        candidate_near_label([token("微 信 号 : abc_123", 0, width=145)])[0]
+        == "abc_123"
+    )
+
+
+def test_label_value_on_next_visual_line_requires_nearby_alignment():
+    close = [
+        token("微信号：", 20, y=10, width=58),
+        token("abc_123", 28, y=32, width=70),
+    ]
+    far = [
+        token("微信号：", 20, y=10, width=58),
+        token("abc_123", 220, y=32, width=70),
+    ]
+    assert candidate_near_label(close)[0] == "abc_123"
+    assert candidate_near_label(far)[0] is None
+
+
+def test_label_without_candidate_and_invalid_candidate_are_distinguished():
+    missing = extractor([[token("微信号：", 0, width=58)]] * 2).extract(
+        Image.new("RGB", (200, 60))
+    )
+    assert missing.reason == "OCR_LABEL_FOUND_VALUE_NOT_FOUND"
+    invalid = extractor(
+        [[token("微信号：", 0, width=58), token("bad@id", 65)]] * 2
+    ).extract(Image.new("RGB", (200, 60)))
+    assert invalid.reason == "OCR_VALUE_INVALID"
+
+
+def test_other_profile_fields_without_wechat_label_are_not_ocr_engine_failures():
+    result = extractor([[token("昵称", 0), token("地区", 80)]] * 2).extract(
+        Image.new("RGB", (200, 60))
+    )
+    assert result.status == "WECHAT_ID_NOT_VISIBLE"
+
+
+def test_profile_roi_stability_timeout_is_specific():
+    from pyweixin.visual_navigation import PROFILE_NOT_STABLE, Win32VisualNavigation
+
+    nav = object.__new__(Win32VisualNavigation)
+    nav.hwnd = 1
+    nav._screenshot = lambda _hwnd: Image.new("RGB", (100, 100), (0, 0, 0))
+    nav._wait = lambda _seconds: None
+    # Deterministic timeout without wall-clock waiting.
+    import pyweixin.visual_navigation as module
+
+    ticks = iter([0.0, 0.0, 6.0])
+    monkeypatch_time = module.time.perf_counter
+    module.time.perf_counter = lambda: next(ticks)
+    try:
+        with pytest.raises(Exception) as exc:
+            nav.wait_profile_stable()
+        assert getattr(exc.value, "status", None) == PROFILE_NOT_STABLE
+    finally:
+        module.time.perf_counter = monkeypatch_time
+
+
+def test_profile_roi_stability_returns_after_two_stable_deltas():
+    from pyweixin.visual_navigation import Win32VisualNavigation
+
+    nav = object.__new__(Win32VisualNavigation)
+    nav.hwnd = 1
+    nav._screenshot = lambda _hwnd: Image.new("RGB", (120, 100), (50, 50, 50))
+    nav._wait = lambda _seconds: None
+    stable, latency = nav.wait_profile_stable()
+    assert stable.size == (120, 100)
+    assert latency >= 0
+
+
+def test_diagnostic_tokens_never_log_merged_wechat_id(monkeypatch):
+    from wechat_ocr import extractor as extractor_module
+
+    class Stub:
+        def recognize(self, _image):
+            return [token("微信号：sensitive_id123", 0, width=190)]
+
+    monkeypatch.setattr(extractor_module, "get_ocr_engine", lambda _config: Stub())
+    monkeypatch.setenv("WECHAT_OCR_DIAGNOSTIC", "true")
+    report = extractor_module.diagnose_profile_rois(
+        {"original": Image.new("RGB", (120, 60))}
+    )
+    tokens = report["original"]["scales"]["2"]["tokens"]
+    assert tokens[0]["token_type"] == "SYSTEM_LABEL"
+    assert tokens[0]["safe_text"] == "微信号"
+    assert all("sensitive_id123" not in item["safe_text"] for item in tokens)
 
 
 def test_uia_helper_is_label_anchored():

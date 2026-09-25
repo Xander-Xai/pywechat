@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import os
 import re
+import time
 from typing import Iterable, Sequence
 
 from .config import DEFAULT_CONFIG, WeChatIdOcrConfig
@@ -11,17 +13,122 @@ from .errors import OcrError
 from .preprocess import recognition_views
 from .models import WeChatIdResult
 from .validator import normalize_candidate, risky_characters, validate_wechat_id
+from .masking import mask_wechat_id
 
 _LABEL = re.compile(
-    r"^(?:微信号|微信\s*ID|WeChat\s*ID|Weixin\s*ID)\s*[:：]?\s*(.*)$", re.I
+    r"^(?:微\s*信\s*号|微信\s*ID|WeChat\s*ID|Weixin\s*ID)\s*([:：])?\s*(.*)$", re.I
 )
 
 
 def _label_token(text: str) -> tuple[bool, str]:
+    # Whitespace normalization applies only to the fixed UI label. Candidate
+    # characters in the original token are preserved for strict validation.
     match = _LABEL.match(text.strip())
     if not match:
         return False, ""
-    return True, match.group(1).strip()
+    separator, suffix = match.groups()
+    # A merged label/value token is accepted only with an explicit colon.
+    return True, suffix if separator else ""
+
+
+def label_diagnostics(tokens: Sequence[OcrToken]) -> dict[str, object]:
+    """Return PII-safe extraction evidence; never includes token text."""
+    label_tokens = []
+    approximate = False
+    for token in tokens:
+        found, _ = _label_token(token.text)
+        if found:
+            label_tokens.append(token)
+        elif "微信" in token.text and any(ch in token.text for ch in "号昵地备"):
+            approximate = True
+    candidate, score = candidate_near_label(tokens)
+    return {
+        "detected_box_count": len(tokens),
+        "recognized_token_count": sum(bool(token.text.strip()) for token in tokens),
+        "has_wechat_label": bool(label_tokens),
+        "has_approximate_label": approximate,
+        "candidate_found": candidate is not None,
+        "candidate_valid": bool(candidate and validate_wechat_id(candidate).valid),
+        "candidate_confidence": score,
+        "failure_stage": (
+            "OCR_LABEL_NOT_FOUND"
+            if not label_tokens
+            else "OCR_LABEL_FOUND_VALUE_NOT_FOUND"
+            if not candidate
+            else "OCR_VALUE_INVALID"
+            if not validate_wechat_id(candidate).valid
+            else "OCR_CANDIDATE_FOUND"
+        ),
+    }
+
+
+def diagnose_profile_rois(rois: dict[str, object]) -> dict[str, object]:
+    """Run the finite PII-safe 1x/2x/3x two-view profile benchmark."""
+    engine = get_ocr_engine(DEFAULT_CONFIG)
+    report: dict[str, object] = {}
+    started = time.perf_counter()
+    for roi_name, image in rois.items():
+        scale_report = {}
+        for scale in (1, 2, 3):
+            pair = []
+            token_log = []
+            scale_started = time.perf_counter()
+            for view_index, view in enumerate(recognition_views(image, scale)):
+                tokens = engine.recognize(view)
+                evidence = label_diagnostics(tokens)
+                pair.append(evidence)
+                if os.getenv("WECHAT_OCR_DIAGNOSTIC", "false").casefold() == "true":
+                    for token in tokens:
+                        normalized = token.text.strip()
+                        label, _ = _label_token(normalized)
+                        valid = validate_wechat_id(normalized).valid
+                        if label:
+                            token_type, safe_text = "SYSTEM_LABEL", "微信号"
+                        elif normalized in {"昵称", "地区", "备注", "电话"}:
+                            token_type, safe_text = "SYSTEM_LABEL", normalized
+                        elif valid:
+                            token_type, safe_text = (
+                                "POTENTIAL_ID",
+                                mask_wechat_id(normalized),
+                            )
+                        else:
+                            token_type, safe_text = "OTHER_REDACTED", "<REDACTED>"
+                        token_log.append(
+                            {
+                                "view": view_index,
+                                "token_type": token_type,
+                                "safe_text": safe_text,
+                                "bbox": [
+                                    round(token.left, 1),
+                                    round(token.top, 1),
+                                    round(token.right, 1),
+                                    round(token.bottom, 1),
+                                ],
+                                "confidence": round(token.confidence, 4),
+                            }
+                        )
+            scale_report[str(scale)] = {
+                "detected_box_count": [item["detected_box_count"] for item in pair],
+                "recognized_token_count": [
+                    item["recognized_token_count"] for item in pair
+                ],
+                "has_wechat_label": [item["has_wechat_label"] for item in pair],
+                "has_approximate_label": [
+                    item["has_approximate_label"] for item in pair
+                ],
+                "candidate_found": [item["candidate_found"] for item in pair],
+                "candidate_valid": [item["candidate_valid"] for item in pair],
+                "confidence": [item["candidate_confidence"] for item in pair],
+                "latency_seconds": round(time.perf_counter() - scale_started, 3),
+                "tokens": token_log,
+            }
+        report[roi_name] = {
+            "width": image.width,
+            "height": image.height,
+            "scales": scale_report,
+        }
+    report["total_latency_seconds"] = round(time.perf_counter() - started, 3)
+    return report
 
 
 def candidate_near_label(
@@ -103,14 +210,20 @@ class WeChatIdExtractor:
             return WeChatIdResult(status="OCR_FAILED", reason="ocr_primary_disabled")
         candidates: list[str | None] = []
         scores: list[float | None] = []
+        view_diagnostics: list[dict[str, object]] = []
+        recognized_views: list[list[OcrToken]] = []
         try:
             engine = self._engine or get_ocr_engine(self.config)
             for view in recognition_views(image):
-                value, score = candidate_near_label(engine.recognize(view), self.config)
+                tokens = engine.recognize(view)
+                recognized_views.append(tokens)
+                evidence = label_diagnostics(tokens)
+                value, score = candidate_near_label(tokens, self.config)
                 if value and not validate_wechat_id(value, self.config).valid:
                     value = None
                 candidates.append(value)
                 scores.append(score)
+                view_diagnostics.append(evidence)
         except OcrError as exc:
             return WeChatIdResult(
                 status="OCR_FAILED",
@@ -127,16 +240,55 @@ class WeChatIdExtractor:
                 reason="OCR_INFERENCE_FAILED",
                 diagnostics=["OCR_FAILED"],
             )
-        return reconcile_ocr_result(
+        result = reconcile_ocr_result(
             WeChatIdResult(
                 ocr_candidates=candidates,
                 confidence=min(
                     (score for score in scores if score is not None), default=None
                 ),
+                view_diagnostics=view_diagnostics,
+                diagnostics=[str(item["failure_stage"]) for item in view_diagnostics],
             ),
             ui_candidate,
             self.config,
         )
+        if result.status == "NOT_FOUND":
+            labels = [bool(item["has_wechat_label"]) for item in view_diagnostics]
+            any_text = any(
+                int(item["recognized_token_count"]) for item in view_diagnostics
+            )
+            other_profile_labels = any(
+                any(label in token.text for label in ("昵称", "地区", "备注", "电话"))
+                for tokens in recognized_views
+                for token in tokens
+            )
+            raw_candidates = [
+                candidate_near_label(tokens, self.config)[0]
+                for tokens in recognized_views
+            ]
+            if all(labels) and any(
+                value and not validate_wechat_id(value, self.config).valid
+                for value in raw_candidates
+            ):
+                result.reason = "OCR_VALUE_INVALID"
+                result.status = "OCR_VALUE_INVALID"
+            elif all(labels):
+                result.reason = "OCR_LABEL_FOUND_VALUE_NOT_FOUND"
+                result.status = "OCR_LABEL_FOUND_VALUE_NOT_FOUND"
+            elif not any_text:
+                result.reason = "OCR_NO_TEXT"
+                result.status = "OCR_NO_TEXT"
+            elif other_profile_labels:
+                result.reason = "WECHAT_ID_NOT_VISIBLE"
+                result.status = "WECHAT_ID_NOT_VISIBLE"
+            else:
+                result.reason = "OCR_LABEL_NOT_FOUND"
+                result.status = "OCR_LABEL_NOT_FOUND"
+        elif result.reason == "view_disagreement":
+            result.diagnostics.append("OCR_VIEW_DISAGREEMENT")
+        elif result.reason == "uia_mismatch":
+            result.diagnostics.append("OCR_UIA_DISAGREEMENT")
+        return result
 
 
 def reconcile_ocr_result(
@@ -173,7 +325,12 @@ def reconcile_ocr_result(
                 reason="uia_only",
                 diagnostics=["UIA_CANDIDATE", "NEED_REVIEW"],
             )
-        return WeChatIdResult(status="NOT_FOUND", reason="label_or_value_not_found")
+        return WeChatIdResult(
+            status=ocr_result.status,
+            reason=ocr_result.reason or "label_or_value_not_found",
+            diagnostics=list(ocr_result.diagnostics),
+            view_diagnostics=list(ocr_result.view_diagnostics),
+        )
     if candidates[0] != candidates[1]:
         return WeChatIdResult(
             value=None,
@@ -184,6 +341,7 @@ def reconcile_ocr_result(
             ui_candidate=ui_candidate,
             reason="view_disagreement",
             diagnostics=["OCR_DISAGREEMENT", "NEED_REVIEW"],
+            view_diagnostics=list(ocr_result.view_diagnostics),
         )
     value = candidates[0]
     assert value is not None
@@ -197,7 +355,12 @@ def reconcile_ocr_result(
             ocr_candidates=candidates,
             ui_candidate=ui_candidate,
             reason="uia_mismatch",
-            diagnostics=["CROSS_CHECK_MISMATCH", "NEED_REVIEW"],
+            diagnostics=[
+                "CROSS_CHECK_MISMATCH",
+                "OCR_UIA_DISAGREEMENT",
+                "NEED_REVIEW",
+            ],
+            view_diagnostics=list(ocr_result.view_diagnostics),
         )
     if confidence is not None and confidence >= cfg.min_confidence_confirm:
         return WeChatIdResult(

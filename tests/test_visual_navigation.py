@@ -144,6 +144,15 @@ def test_profile_fallback_roi_scales_with_window():
     assert crop.size == (678, 814)
 
 
+def test_profile_roi_diagnostic_tiers_are_bounded_and_nested():
+    nav = object.__new__(Win32VisualNavigation)
+    rois, _ = nav.profile_rois(Image.new("RGB", (880, 640), "white"))
+    assert set(rois) == {"original", "expanded", "right_panel"}
+    assert rois["original"].width < rois["expanded"].width
+    assert rois["expanded"].width < rois["right_panel"].width
+    assert all(image.height <= 640 for image in rois.values())
+
+
 def test_profile_roi_prefers_valid_uia_rectangle_and_rejects_invalid_hint():
     image = icon_fixture()
     nav = Win32VisualNavigation(

@@ -10,7 +10,19 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Literal
 
-Status = Literal["CONFIRMED", "NEED_REVIEW", "NOT_FOUND", "OCR_FAILED"]
+Status = Literal[
+    "CONFIRMED",
+    "NEED_REVIEW",
+    "NOT_FOUND",
+    "OCR_FAILED",
+    "OCR_NO_TEXT",
+    "OCR_LABEL_NOT_FOUND",
+    "OCR_LABEL_FOUND_VALUE_NOT_FOUND",
+    "OCR_VALUE_INVALID",
+    "OCR_VIEW_DISAGREEMENT",
+    "OCR_UIA_DISAGREEMENT",
+    "WECHAT_ID_NOT_VISIBLE",
+]
 Source = Literal["ocr", "ocr+uia", "uia", "none"]
 
 
@@ -42,6 +54,7 @@ class WeChatIdResult:
     reason: str | None = None
     risky_chars: list[str] = field(default_factory=list)
     diagnostics: list[str] = field(default_factory=list)
+    view_diagnostics: list[dict[str, object]] = field(default_factory=list)
 
     @property
     def is_confirmed(self) -> bool:
