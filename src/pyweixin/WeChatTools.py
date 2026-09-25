@@ -779,7 +779,14 @@ class Navigator():
                 win32gui.SendMessage(hwnd, win32con.WM_SYSCOMMAND, win32con.SC_MAXIMIZE,0)
             if not is_maximize:
                 win32gui.SendMessage(hwnd, win32con.WM_SYSCOMMAND, win32con.SC_RESTORE,0)
-            win32gui.SetForegroundWindow(hwnd)
+            from .visual_navigation import (
+                WINDOW_FOREGROUND_REJECTED,
+                NavigationFailure,
+                foreground_wechat_window,
+            )
+
+            if not foreground_wechat_window(hwnd):
+                raise NavigationFailure(WINDOW_FOREGROUND_REJECTED)
             offline_button=main_window.child_window(**Buttons.OffLineButton)
             try:
                 offline=offline_button.exists(timeout=0.1)
@@ -1163,7 +1170,9 @@ class Navigator():
         from .visual_navigation import (
             NavigationFailure,
             VisualContactSession,
+            WINDOW_FOREGROUND_REJECTED,
             Win32VisualNavigation,
+            foreground_wechat_window,
         )
         import win32con
         import win32gui
@@ -1199,8 +1208,8 @@ class Navigator():
             pass
 
         win32gui.ShowWindow(main_window.handle,win32con.SW_RESTORE)
-        win32gui.SetForegroundWindow(main_window.handle)
-        time.sleep(0.25)
+        if not foreground_wechat_window(main_window.handle):
+            raise NavigationFailure(WINDOW_FOREGROUND_REJECTED)
         evidence=navigator.open_contacts(
             uia_hint=uia_contacts_hint,
             uia_list_hint=uia_list_hint,

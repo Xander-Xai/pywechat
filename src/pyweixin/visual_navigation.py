@@ -22,6 +22,10 @@ CONTACT_LIST_NOT_FOUND = "CONTACT_LIST_NOT_FOUND"
 CONTACT_PROFILE_NOT_FOUND = "CONTACT_PROFILE_NOT_FOUND"
 OCR_FAILED = "OCR_FAILED"
 PROFILE_NOT_STABLE = "PROFILE_NOT_STABLE"
+PROFILE_POPUP_OPENED = "PROFILE_POPUP_OPENED"
+PROFILE_POPUP_NOT_OPENED = "PROFILE_POPUP_NOT_OPENED"
+PROFILE_POPUP_UNRESOLVED = "PROFILE_POPUP_UNRESOLVED"
+WINDOW_FOREGROUND_REJECTED = "WINDOW_FOREGROUND_REJECTED"
 
 PROFILE_STABLE_WAIT_MS = 300
 PROFILE_STABLE_TIMEOUT_MS = 5000
@@ -179,6 +183,188 @@ class PageEvidence:
     method: str
     hint_count: int = 0
     latency_seconds: float = 0.0
+
+
+@dataclass(frozen=True)
+class FriendProfileSurface:
+    source: str
+    hwnd: int | None
+    bounds: tuple[int, int, int, int]
+    confidence: float
+    verification_signals: tuple[str, ...]
+    image: Image.Image
+
+
+def focus_window_with_bounded_retry(
+    hwnd: int,
+    *,
+    is_iconic: Callable[[int], bool],
+    show_restore: Callable[[int], object],
+    bring_to_top: Callable[[int], object],
+    set_foreground: Callable[[int], object],
+    get_foreground: Callable[[], int],
+    wait: Callable[[float], None] = time.sleep,
+    attempts: int = 3,
+) -> bool:
+    """Restore and foreground a window with a strict retry and delay bound."""
+    for attempt in range(min(3, max(1, attempts))):
+        try:
+            if is_iconic(hwnd):
+                show_restore(hwnd)
+            bring_to_top(hwnd)
+            set_foreground(hwnd)
+            if get_foreground() == hwnd:
+                return True
+        except Exception:
+            pass
+        if attempt + 1 < min(3, max(1, attempts)):
+            wait(0.12)
+    return False
+
+
+def detect_friend_avatar_anchor(
+    profile_image: Image.Image, tokens: Sequence[object]
+) -> AnchorMatch | None:
+    """Derive one avatar point from adjacent OCR geometry and image texture."""
+    width, height = profile_image.size
+    candidates = []
+    for token in tokens:
+        box = getattr(token, "box", None)
+        if not box:
+            continue
+        left = min(point[0] for point in box)
+        top = min(point[1] for point in box)
+        bottom = max(point[1] for point in box)
+        center_y = (top + bottom) / 2
+        if 0.08 * height <= center_y <= 0.55 * height and left >= 0.16 * width:
+            candidates.append(
+                (top, left, center_y, float(getattr(token, "confidence", 0.0)))
+            )
+    if not candidates:
+        return None
+    _, text_left, center_y, text_confidence = min(candidates)
+    avatar_size = max(28, round(min(width, height) * 0.13))
+    center_x = text_left - avatar_size * 0.63
+    bounds = (
+        round(center_x - avatar_size / 2),
+        round(center_y - avatar_size / 2),
+        round(center_x + avatar_size / 2),
+        round(center_y + avatar_size / 2),
+    )
+    if (
+        bounds[0] < 0
+        or bounds[1] < 0
+        or bounds[2] > width
+        or bounds[3] > height
+        or center_x > text_left - avatar_size * 0.3
+    ):
+        return None
+    texture = _gray_region_score(profile_image, bounds)
+    layout_score = 1.0 if 0.08 * width <= center_x <= 0.78 * width else 0.0
+    confidence = min(1.0, 0.58 * texture + 0.24 * text_confidence + 0.18 * layout_score)
+    if texture < 0.18 or confidence < 0.50:
+        return None
+    return AnchorMatch(
+        center_x / width,
+        center_y / height,
+        confidence,
+        "profile_text+avatar_texture",
+    )
+
+
+def select_popup_window(
+    windows: Sequence[dict[str, object]], main_hwnd: int
+) -> dict[str, object] | None:
+    """Choose a visible Weixin profile popup owned by the target main HWND."""
+    for window in windows:
+        if not window.get("visible") or window.get("hwnd") == main_hwnd:
+            continue
+        cls = str(window.get("class_name", ""))
+        title = str(window.get("title", ""))
+        owner = int(window.get("owner", 0) or 0)
+        if cls == "mmui::ProfileUniquePop" and (
+            owner == main_hwnd or title == "Weixin"
+        ):
+            return window
+    return None
+
+
+def has_profile_content(tokens: Sequence[object]) -> bool:
+    """Require multiple recognized profile fields before accepting a popup."""
+    recognized = {
+        term.casefold()
+        for term in PROFILE_FIELD_TERMS
+        if any(
+            term.casefold() in str(getattr(token, "text", "")).casefold()
+            for token in tokens
+        )
+    }
+    return len(recognized) >= 2
+
+
+def detect_popup_diff_bounds(
+    before: Image.Image, after: Image.Image
+) -> tuple[tuple[int, int, int, int], float] | None:
+    """Estimate a centered same-HWND popup from high-contrast frame deltas."""
+    if before.size != after.size or before.width < 160 or before.height < 120:
+        return None
+    delta = ImageChops.difference(before.convert("L"), after.convert("L"))
+    tile = max(8, min(before.size) // 32)
+    samples = []
+    points = []
+    for top in range(0, before.height, tile):
+        for left in range(0, before.width, tile):
+            right = min(before.width, left + tile)
+            bottom = min(before.height, top + tile)
+            mean = ImageStat.Stat(delta.crop((left, top, right, bottom))).mean[0]
+            samples.append(mean)
+            points.append((left, top, right, bottom, mean))
+    median = sorted(samples)[len(samples) // 2]
+    threshold = max(24.0, median + 18.0)
+    active = [item for item in points if item[4] >= threshold]
+    if len(active) < 12:
+        return None
+    left = min(item[0] for item in active)
+    top = min(item[1] for item in active)
+    right = max(item[2] for item in active)
+    bottom = max(item[3] for item in active)
+    box_width, box_height = right - left, bottom - top
+    if not (0.18 <= box_width / before.width <= 0.78):
+        return None
+    if not (0.16 <= box_height / before.height <= 0.82):
+        return None
+    if not (0.20 <= (left + right) / (2 * before.width) <= 0.80):
+        return None
+    density = len(active) / max(
+        1, ((box_width + tile - 1) // tile) * ((box_height + tile - 1) // tile)
+    )
+    if density < 0.24:
+        return None
+    confidence = min(1.0, 0.48 + 0.45 * density)
+    return (left, top, right, bottom), confidence
+
+
+def foreground_wechat_window(
+    hwnd: int, wait: Callable[[float], None] = time.sleep
+) -> bool:
+    """Win32 foreground helper with a bounded restore/raise/verify cycle."""
+    import win32con
+    import win32gui
+
+    def foreground_root() -> int:
+        current = win32gui.GetForegroundWindow()
+        return win32gui.GetAncestor(current, win32con.GA_ROOT) if current else 0
+
+    return focus_window_with_bounded_retry(
+        hwnd,
+        is_iconic=win32gui.IsIconic,
+        show_restore=lambda target: win32gui.ShowWindow(target, win32con.SW_RESTORE),
+        bring_to_top=win32gui.BringWindowToTop,
+        set_foreground=win32gui.SetForegroundWindow,
+        get_foreground=foreground_root,
+        wait=wait,
+        attempts=3,
+    )
 
 
 def _normalized_box(box, width: int, height: int) -> NormalizedRect:
@@ -375,6 +561,8 @@ class Win32VisualNavigation:
         screenshot: Callable[[int], Image.Image] | None = None,
         click: Callable[[int, int], None] | None = None,
         foreground: Callable[[], int] | None = None,
+        popup_windows: Callable[[], Sequence[dict[str, object]]] | None = None,
+        capture_window: Callable[[int], Image.Image] | None = None,
         wait: Callable[[float], None] = time.sleep,
         mapper: WindowCoordinateMapper | None = None,
     ):
@@ -384,6 +572,8 @@ class Win32VisualNavigation:
         self._screenshot = screenshot or self._capture_client
         self._click = click or self._click_once
         self._foreground = foreground or self._foreground_root
+        self._popup_windows = popup_windows or self._enumerate_profile_popups
+        self._capture_window = capture_window or self._capture_window_client
         self._wait = wait
         self._auto_mapper = mapper is None
         self.mapper = mapper or self._window_mapper()
@@ -609,6 +799,252 @@ class Win32VisualNavigation:
         }
         return y_ratio
 
+    @staticmethod
+    def _enumerate_profile_popups() -> Sequence[dict[str, object]]:
+        import win32gui
+
+        windows = []
+
+        def collect(hwnd, _context):
+            if not win32gui.IsWindowVisible(hwnd):
+                return True
+            try:
+                windows.append(
+                    {
+                        "hwnd": hwnd,
+                        "owner": win32gui.GetWindow(hwnd, 4),
+                        "title": win32gui.GetWindowText(hwnd),
+                        "class_name": win32gui.GetClassName(hwnd),
+                        "visible": True,
+                    }
+                )
+            except Exception:
+                pass
+            return True
+
+        win32gui.EnumWindows(collect, None)
+        return windows
+
+    @staticmethod
+    def _capture_window_client(hwnd: int) -> Image.Image:
+        import win32gui
+        from PIL import ImageGrab
+
+        client = win32gui.GetClientRect(hwnd)
+        upper_left = win32gui.ClientToScreen(hwnd, (client[0], client[1]))
+        lower_right = win32gui.ClientToScreen(hwnd, (client[2], client[3]))
+        return ImageGrab.grab(
+            bbox=(*upper_left, *lower_right), all_screens=True
+        ).convert("RGB")
+
+    def _wait_surface_stable(
+        self, surface: FriendProfileSurface, timeout_ms: int = 3000
+    ) -> FriendProfileSurface:
+        started = time.perf_counter()
+        deadline = started + timeout_ms / 1000
+        previous = None
+        stable = 0
+        while time.perf_counter() < deadline:
+            current = (
+                self._capture_window(surface.hwnd)
+                if surface.hwnd
+                else self._screenshot(self.hwnd).crop(surface.bounds)
+            )
+            if previous is not None and previous.size == current.size:
+                delta = ImageStat.Stat(
+                    ImageChops.difference(previous.convert("L"), current.convert("L"))
+                ).mean[0]
+                stable = stable + 1 if delta <= PROFILE_STABLE_MEAN_DIFF else 0
+                if stable >= 2:
+                    return FriendProfileSurface(
+                        surface.source,
+                        surface.hwnd,
+                        surface.bounds,
+                        surface.confidence,
+                        (*surface.verification_signals, "stable_frames"),
+                        current,
+                    )
+            previous = current
+            self._wait(PROFILE_STABLE_WAIT_MS / 1000)
+        raise NavigationFailure(PROFILE_NOT_STABLE, "popup surface did not settle")
+
+    def open_friend_profile_visual(
+        self,
+        *,
+        page_verified: bool,
+        profile_crop: Image.Image | None = None,
+        profile_tokens: Sequence[object] | None = None,
+    ) -> FriendProfileSurface:
+        """Open and verify one Friend Profile Popup from the selected detail card."""
+        if not page_verified:
+            raise NavigationFailure(CONTACTS_PAGE_NOT_CONFIRMED)
+        if self._foreground() != self.hwnd:
+            raise NavigationFailure(WINDOW_FOREGROUND_REJECTED)
+        started = time.perf_counter()
+        self.last_popup_timing = {}
+        self.last_popup_status = PROFILE_POPUP_UNRESOLVED
+        before = self._screenshot(self.hwnd)
+        if profile_crop is None:
+            profile_crop, _ = self.profile_image(page_verified=True, image=before)
+        tokens = (
+            profile_tokens
+            if profile_tokens is not None
+            else getattr(self, "last_profile_tokens", ())
+        )
+        anchor = detect_friend_avatar_anchor(profile_crop, tokens)
+        if anchor is None or anchor.confidence < 0.50:
+            self.last_popup_status = PROFILE_POPUP_UNRESOLVED
+            self.last_popup_timing = {
+                "popup_anchor": time.perf_counter() - started,
+                "popup_open": 0.0,
+                "popup_stability_wait": 0.0,
+            }
+            raise NavigationFailure(
+                PROFILE_POPUP_UNRESOLVED, "avatar anchor unresolved"
+            )
+
+        # Re-capture and recompute the one OCR-derived target immediately
+        # before clicking; a moved or ambiguous anchor fails closed.
+        current = self._screenshot(self.hwnd)
+        current_crop, _ = self.profile_image(page_verified=True, image=current)
+        current_anchor = detect_friend_avatar_anchor(
+            current_crop, getattr(self, "last_profile_tokens", tokens)
+        )
+        if (
+            current_anchor is None
+            or anchor.method != current_anchor.method
+            or not anchors_agree(
+                (anchor.x_ratio, anchor.y_ratio),
+                (current_anchor.x_ratio, current_anchor.y_ratio),
+            )
+        ):
+            self.last_popup_status = PROFILE_POPUP_UNRESOLVED
+            self.last_popup_timing = {
+                "popup_anchor": time.perf_counter() - started,
+                "popup_open": 0.0,
+                "popup_stability_wait": 0.0,
+            }
+            raise NavigationFailure(PROFILE_POPUP_UNRESOLVED, "avatar anchor shifted")
+
+        left, top, right, bottom = PROFILE_FALLBACK_REGION
+        x_ratio = left + current_anchor.x_ratio * (right - left)
+        y_ratio = top + current_anchor.y_ratio * (bottom - top)
+        click_region = NormalizedRect(left, top, right, 0.62)
+        point = self._validate_click(x_ratio, y_ratio, click_region)
+        old_popups = {int(item.get("hwnd", 0)) for item in self._popup_windows()}
+        click_started = time.perf_counter()
+        popup_anchor_latency = click_started - started
+        self._click(*point)
+
+        unresolved_diff = None
+        for _ in range(7):
+            self._wait(0.3)
+            new_popup = next(
+                (
+                    item
+                    for item in self._popup_windows()
+                    if int(item.get("hwnd", 0)) not in old_popups
+                    and select_popup_window([item], self.hwnd) is not None
+                ),
+                None,
+            )
+            if new_popup:
+                popup_detected_at = time.perf_counter()
+                popup_hwnd = int(new_popup["hwnd"])
+                rect = self._window_rect(popup_hwnd)
+                raw_image = self._capture_window(popup_hwnd)
+                surface = FriendProfileSurface(
+                    "popup_hwnd",
+                    popup_hwnd,
+                    rect,
+                    0.88,
+                    ("owned_profile_popup_hwnd",),
+                    raw_image,
+                )
+                stable_surface = self._wait_surface_stable(surface)
+                popup_tokens = self._tokens(stable_surface.image)
+                if (
+                    not has_profile_content(popup_tokens)
+                    or stable_surface.confidence < 0.60
+                ):
+                    self.last_popup_status = PROFILE_POPUP_UNRESOLVED
+                    raise NavigationFailure(
+                        PROFILE_POPUP_UNRESOLVED, "popup lacks profile text evidence"
+                    )
+                self.last_popup_status = PROFILE_POPUP_OPENED
+                self.last_popup_timing = {
+                    "popup_anchor": popup_anchor_latency,
+                    "popup_open": popup_detected_at - click_started,
+                    "popup_stability_wait": time.perf_counter() - popup_detected_at,
+                    "total": time.perf_counter() - started,
+                }
+                return stable_surface
+
+            after = self._screenshot(self.hwnd)
+            if image_fingerprint(after) != image_fingerprint(current):
+                diff = detect_popup_diff_bounds(current, after)
+                if diff:
+                    popup_detected_at = time.perf_counter()
+                    bounds, confidence = diff
+                    crop = after.crop(bounds)
+                    if confidence >= 0.60 and has_profile_content(self._tokens(crop)):
+                        unresolved_diff = FriendProfileSurface(
+                            "screenshot_diff",
+                            None,
+                            bounds,
+                            confidence,
+                            ("same_hwnd_visual_bounds", "profile_text_density"),
+                            crop,
+                        )
+                        self.last_popup_detected_at = popup_detected_at
+                        break
+                    unresolved_diff = FriendProfileSurface(
+                        "screenshot_diff",
+                        None,
+                        bounds,
+                        confidence,
+                        ("same_hwnd_visual_bounds",),
+                        crop,
+                    )
+
+        if (
+            unresolved_diff
+            and "profile_text_density" in unresolved_diff.verification_signals
+        ):
+            stable_surface = self._wait_surface_stable(unresolved_diff)
+            self.last_popup_status = PROFILE_POPUP_OPENED
+            self.last_popup_timing = {
+                "popup_anchor": popup_anchor_latency,
+                "popup_open": self.last_popup_detected_at - click_started,
+                "popup_stability_wait": time.perf_counter()
+                - self.last_popup_detected_at,
+                "total": time.perf_counter() - started,
+            }
+            return stable_surface
+        if unresolved_diff:
+            self.last_popup_status = PROFILE_POPUP_UNRESOLVED
+            self.last_popup_timing = {
+                "popup_anchor": popup_anchor_latency,
+                "popup_open": time.perf_counter() - click_started,
+                "popup_stability_wait": 0.0,
+            }
+            raise NavigationFailure(
+                PROFILE_POPUP_UNRESOLVED, "popup diff lacks text evidence"
+            )
+        self.last_popup_status = PROFILE_POPUP_NOT_OPENED
+        self.last_popup_timing = {
+            "popup_anchor": popup_anchor_latency,
+            "popup_open": time.perf_counter() - click_started,
+            "popup_stability_wait": 0.0,
+        }
+        raise NavigationFailure(PROFILE_POPUP_NOT_OPENED, "no popup surface verified")
+
+    @staticmethod
+    def _window_rect(hwnd: int) -> tuple[int, int, int, int]:
+        import win32gui
+
+        return tuple(win32gui.GetWindowRect(hwnd))
+
     def wait_profile_stable(self) -> tuple[Image.Image, float]:
         """Poll in-memory right-panel frames until two consecutive deltas settle."""
         started = time.perf_counter()
@@ -690,6 +1126,7 @@ class Win32VisualNavigation:
         if crop.width < 16 or crop.height < 16:
             raise NavigationFailure(CONTACT_PROFILE_NOT_FOUND)
         tokens = self._tokens(crop)
+        self.last_profile_tokens = tokens
         matched_profile_labels = {
             term.casefold()
             for term in PROFILE_FIELD_TERMS
@@ -746,87 +1183,93 @@ class Win32VisualNavigation:
         *,
         page_verified: bool,
         uia_rect: tuple[int, int, int, int] | None = None,
-        uia_candidate: str | None = None,
+        uia_candidate_provider: Callable[[int | None], str | None] | None = None,
     ):
-        """Capture the profile ROI and call the existing shared ID extractor."""
+        """Prefer verified popup OCR; use the Contacts detail panel only as fallback."""
         import json
         import os
 
         from wechat_ocr import DEFAULT_CONFIG, WeChatIdExtractor
-        from wechat_ocr.extractor import diagnose_profile_rois, reconcile_ocr_result
+        from wechat_ocr.extractor import label_diagnostics, reconcile_ocr_result
 
         frame = getattr(self, "last_stable_frame", None)
-        image, capture_latency = self.profile_image(
+        right_panel_image, capture_latency = self.profile_image(
             page_verified=page_verified, uia_rect=uia_rect, image=frame
         )
-        rois, roi_latency = self.profile_rois(image=frame)
-        benchmark_started = time.perf_counter()
-        run_benchmark = not getattr(self, "multiscale_benchmark_complete", False)
-        benchmark = diagnose_profile_rois(rois) if run_benchmark else None
-        if run_benchmark:
-            self.multiscale_benchmark_complete = True
-            benchmark_latency = time.perf_counter() - benchmark_started
-            self.last_roi_diagnostics = benchmark
-        else:
-            benchmark_latency = 0.0
+        right_diag = label_diagnostics(self.last_profile_tokens)
+        self.last_right_panel_diagnostics = right_diag
+        popup_started = time.perf_counter()
+        surface = None
+        self.last_popup_status = PROFILE_POPUP_UNRESOLVED
+        try:
+            surface = self.open_friend_profile_visual(
+                page_verified=page_verified,
+                profile_crop=right_panel_image,
+                profile_tokens=self.last_profile_tokens,
+            )
+        except NavigationFailure as exc:
+            self.last_popup_status = exc.status
+        popup_open_latency = time.perf_counter() - popup_started
+        selected_image = surface.image if surface else right_panel_image
+        ui_started = time.perf_counter()
+        ui_candidate = (
+            uia_candidate_provider(surface.hwnd if surface else None)
+            if uia_candidate_provider
+            else None
+        )
+        ui_latency = time.perf_counter() - ui_started
 
-        def score(item):
-            scales = item["scales"]
-            scale_two = scales["2"]
-            label_count = sum(scale_two["has_wechat_label"])
-            candidate_count = sum(scale_two["candidate_valid"])
-            token_count = sum(scale_two["recognized_token_count"])
-            return candidate_count, label_count, token_count
+        benchmark = None
+        if os.getenv("WECHAT_OCR_DIAGNOSTIC", "false").casefold() == "true":
+            from wechat_ocr.extractor import diagnose_profile_rois
 
-        if benchmark is not None:
-            selected_roi = max(rois, key=lambda key: score(benchmark[key]))
-            if score(benchmark[selected_roi])[0] == 0:
-                selected_roi = "original"
-        else:
-            selected_roi = getattr(self, "last_selected_roi", "original")
-        self.last_selected_roi = selected_roi
-        selected_image = rois[selected_roi]
-        if (
-            benchmark is not None
-            and os.getenv("WECHAT_OCR_DIAGNOSTIC", "false").casefold() == "true"
-        ):
+            benchmark = diagnose_profile_rois(
+                {"popup" if surface else "right_panel": selected_image}
+            )
             print(
                 "WECHAT_OCR_DIAGNOSTIC "
-                + json.dumps(
-                    {
-                        "roi_benchmark": benchmark,
-                        "selected_roi": selected_roi,
-                        "profile_stability_seconds": getattr(
-                            self, "last_profile_stability_seconds", None
-                        ),
-                    },
-                    ensure_ascii=False,
-                    separators=(",", ":"),
-                )
+                + json.dumps(benchmark, ensure_ascii=False, separators=(",", ":"))
             )
         started = time.perf_counter()
         ocr = WeChatIdExtractor(config=DEFAULT_CONFIG).extract(selected_image)
         ocr_latency = time.perf_counter() - started
-        ocr.view_diagnostics.append(
-            {
-                "roi_original_width": image.width,
-                "roi_original_height": image.height,
-                "selected_roi": selected_roi,
-                "roi_latency_seconds": roi_latency,
-                "multiscale_latency_seconds": benchmark_latency,
-                "profile_stability_seconds": getattr(
-                    self, "last_profile_stability_seconds", None
-                ),
-            }
-        )
-        self.last_timing = {
-            "profile_capture": capture_latency,
-            "roi": roi_latency,
-            "multiscale": benchmark_latency,
-            "ocr_dual_view": ocr_latency,
+        consensus_started = time.perf_counter()
+        result = reconcile_ocr_result(ocr, ui_candidate)
+        consensus_latency = time.perf_counter() - consensus_started
+        popup_diagnostics = ocr.view_diagnostics[:2]
+        self.last_popup_diagnostics = {
+            "opened": surface is not None,
+            "status": self.last_popup_status,
+            "source": surface.source if surface else "none",
+            "bounds": surface.bounds if surface else None,
+            "confidence": surface.confidence if surface else None,
+            "text_boxes": sum(
+                int(item.get("detected_box_count", 0)) for item in popup_diagnostics
+            )
+            if surface
+            else 0,
+            "wechat_label_found": any(
+                bool(item.get("has_wechat_label")) for item in popup_diagnostics
+            )
+            if surface
+            else False,
+            "candidate_found": any(ocr.ocr_candidates),
+            "profile_verified": surface is not None,
+            "uia_candidate_found": ui_candidate is not None,
+            "benchmark": benchmark,
         }
-        # UIA remains optional and is only read after the OCR result exists.
-        return reconcile_ocr_result(ocr, uia_candidate), capture_latency, ocr_latency
+        self.last_timing = {
+            "contact_profile_capture": capture_latency,
+            "popup_anchor": self.last_popup_timing.get(
+                "popup_anchor", popup_open_latency
+            ),
+            "popup_open": self.last_popup_timing.get("popup_open", 0.0),
+            "popup_wait": self.last_popup_timing.get("popup_stability_wait", 0.0),
+            "uia": ui_latency,
+            "ocr_dual_view": ocr_latency,
+            "consensus": consensus_latency,
+        }
+        return result, capture_latency, ocr_latency
 
 
 def image_fingerprint(image: Image.Image) -> str:
@@ -849,15 +1292,20 @@ class VisualContactSession:
         self.page_evidence = page_evidence
         self.uia_window = uia_window
 
-    def _uia_candidate(self) -> str | None:
-        if self.uia_window is None:
-            return None
+    def _uia_candidate(self, popup_hwnd: int | None = None) -> str | None:
         try:
             from wechat_ocr import extract_wechat_id_from_uia
 
+            window = self.uia_window
+            if popup_hwnd:
+                from pywinauto import Desktop
+
+                window = Desktop(backend="uia").window(handle=popup_hwnd)
+            if window is None:
+                return None
             texts = [
                 element.window_text()
-                for element in self.uia_window.descendants(control_type="Text")
+                for element in window.descendants(control_type="Text")
             ]
             return extract_wechat_id_from_uia(texts)
         except Exception:
@@ -884,31 +1332,11 @@ class VisualContactSession:
             result, capture_latency, ocr_latency = (
                 self.navigator.extract_selected_profile(
                     page_verified=self.page_evidence.confirmed,
-                    uia_candidate=self._uia_candidate(),
+                    uia_candidate_provider=self._uia_candidate,
                 )
             )
-            roi_data = getattr(self.navigator, "last_roi_diagnostics", {})
-            selected_roi = getattr(self.navigator, "last_selected_roi", "original")
-            roi_stats = roi_data.get(selected_roi, {}).get("scales", {}).get("2", {})
-            if not roi_stats:
-                roi_stats = {
-                    "detected_box_count": [
-                        item.get("detected_box_count", 0)
-                        for item in result.view_diagnostics[:2]
-                    ],
-                    "recognized_token_count": [
-                        item.get("recognized_token_count", 0)
-                        for item in result.view_diagnostics[:2]
-                    ],
-                    "has_wechat_label": [
-                        item.get("has_wechat_label", False)
-                        for item in result.view_diagnostics[:2]
-                    ],
-                    "candidate_found": [
-                        item.get("candidate_found", False)
-                        for item in result.view_diagnostics[:2]
-                    ],
-                }
+            popup = getattr(self.navigator, "last_popup_diagnostics", {})
+            right = getattr(self.navigator, "last_right_panel_diagnostics", {})
             profile_status = result.status
             contact_total = (
                 self.page_evidence.latency_seconds
@@ -933,6 +1361,12 @@ class VisualContactSession:
                     "contacts_page_verified": self.page_evidence.confirmed,
                     "navigation_latency_seconds": self.page_evidence.latency_seconds,
                     "profile_found": True,
+                    "profile_popup_opened": popup.get("opened", False),
+                    "profile_popup_status": popup.get(
+                        "status", "PROFILE_POPUP_UNRESOLVED"
+                    ),
+                    "surface_source": popup.get("source", "none"),
+                    "popup_profile_verified": popup.get("profile_verified", False),
                     "微信号": result.value if result.is_confirmed else "无",
                     "微信号状态": profile_status,
                     "微信号来源": result.source,
@@ -941,26 +1375,35 @@ class VisualContactSession:
                     "微信号候选": result.value if not result.is_confirmed else "",
                     "ocr_found": any(result.ocr_candidates),
                     "uia_found": result.ui_candidate is not None,
-                    "agreement": (
-                        "unavailable"
-                        if result.ui_candidate is None
-                        else "match"
-                        if result.ui_candidate == result.value
-                        else "mismatch"
-                    ),
+                    "agreement": "unavailable"
+                    if result.ui_candidate is None
+                    else "match"
+                    if result.ui_candidate == result.value
+                    else "mismatch",
                     "capture_latency_seconds": capture_latency,
                     "ocr_latency_seconds": ocr_latency,
                     "profile_stable": bool(
                         getattr(self.navigator, "last_profile_stability_seconds", None)
                         is not None
                     ),
-                    "roi_strategy": selected_roi,
-                    "detected_boxes": sum(roi_stats.get("detected_box_count", [])),
+                    "roi_strategy": "popup"
+                    if popup.get("opened")
+                    else "right_panel_secondary",
+                    "detected_boxes": popup.get("text_boxes", 0),
                     "recognized_tokens": sum(
-                        roi_stats.get("recognized_token_count", [])
+                        int(item.get("recognized_token_count", 0))
+                        for item in result.view_diagnostics[:2]
                     ),
-                    "wechat_label_found": any(roi_stats.get("has_wechat_label", [])),
-                    "candidate_found": any(roi_stats.get("candidate_found", [])),
+                    "wechat_label_found": popup.get("wechat_label_found", False)
+                    if popup.get("opened")
+                    else right.get("has_wechat_label", False),
+                    "right_panel_text_boxes": right.get("detected_box_count", 0),
+                    "right_panel_wechat_label_found": right.get(
+                        "has_wechat_label", False
+                    ),
+                    "candidate_found": popup.get("candidate_found", False)
+                    if popup.get("opened")
+                    else any(result.ocr_candidates),
                     "candidate_masked": "<MASKED>" if result.value else "",
                     "failure_stage": result.reason or profile_status,
                     "stage_timing_seconds": stage_timing,
