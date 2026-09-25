@@ -9,6 +9,9 @@ from pyweixin.visual_navigation import (
     CONTACTS_NAV_REGION,
     CONTACT_PROFILE_NOT_FOUND,
     CONTACTS_PAGE_NOT_CONFIRMED,
+    AUTO_FOREGROUND_READY,
+    AUTO_FOREGROUND_REJECTED,
+    OPERATOR_FOREGROUND_REQUIRED,
     PROFILE_POPUP_NOT_OPENED,
     PROFILE_POPUP_OPENED,
     PROFILE_POPUP_UNRESOLVED,
@@ -26,6 +29,7 @@ from pyweixin.visual_navigation import (
     detect_friend_avatar_anchor,
     detect_popup_diff_bounds,
     focus_window_with_bounded_retry,
+    foreground_acquisition_state,
     has_profile_content,
     image_fingerprint,
     select_popup_window,
@@ -431,6 +435,35 @@ def test_foreground_retry_stops_after_three_attempts():
         attempts=9,
     )
     assert len(calls) == 3 and waits == [0.12, 0.12]
+
+
+def test_foreground_acquisition_states_are_separate_from_ocr_statuses():
+    assert (
+        foreground_acquisition_state(
+            target_is_foreground=True, auto_request_succeeded=False
+        )
+        == AUTO_FOREGROUND_READY
+    )
+    assert (
+        foreground_acquisition_state(
+            target_is_foreground=False, auto_request_succeeded=True
+        )
+        == AUTO_FOREGROUND_READY
+    )
+    assert (
+        foreground_acquisition_state(
+            target_is_foreground=False, auto_request_succeeded=False
+        )
+        == AUTO_FOREGROUND_REJECTED
+    )
+    assert (
+        foreground_acquisition_state(
+            target_is_foreground=False,
+            auto_request_succeeded=False,
+            operator_fallback_enabled=True,
+        )
+        == OPERATOR_FOREGROUND_REQUIRED
+    )
 
 
 def _popup_test_nav(*, screenshots, clicks, popups=lambda: (), recognizer=None):

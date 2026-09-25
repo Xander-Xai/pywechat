@@ -26,6 +26,9 @@ PROFILE_POPUP_OPENED = "PROFILE_POPUP_OPENED"
 PROFILE_POPUP_NOT_OPENED = "PROFILE_POPUP_NOT_OPENED"
 PROFILE_POPUP_UNRESOLVED = "PROFILE_POPUP_UNRESOLVED"
 WINDOW_FOREGROUND_REJECTED = "WINDOW_FOREGROUND_REJECTED"
+AUTO_FOREGROUND_READY = "AUTO_FOREGROUND_READY"
+AUTO_FOREGROUND_REJECTED = "AUTO_FOREGROUND_REJECTED"
+OPERATOR_FOREGROUND_REQUIRED = "OPERATOR_FOREGROUND_REQUIRED"
 
 PROFILE_STABLE_WAIT_MS = 300
 PROFILE_STABLE_TIMEOUT_MS = 5000
@@ -355,6 +358,8 @@ def foreground_wechat_window(
         current = win32gui.GetForegroundWindow()
         return win32gui.GetAncestor(current, win32con.GA_ROOT) if current else 0
 
+    if foreground_root() == hwnd:
+        return True
     return focus_window_with_bounded_retry(
         hwnd,
         is_iconic=win32gui.IsIconic,
@@ -364,6 +369,22 @@ def foreground_wechat_window(
         get_foreground=foreground_root,
         wait=wait,
         attempts=3,
+    )
+
+
+def foreground_acquisition_state(
+    *,
+    target_is_foreground: bool,
+    auto_request_succeeded: bool,
+    operator_fallback_enabled: bool = False,
+) -> str:
+    """Return an explicit navigation state, separate from all OCR statuses."""
+    if target_is_foreground or auto_request_succeeded:
+        return AUTO_FOREGROUND_READY
+    return (
+        OPERATOR_FOREGROUND_REQUIRED
+        if operator_fallback_enabled
+        else AUTO_FOREGROUND_REJECTED
     )
 
 
@@ -879,7 +900,7 @@ class Win32VisualNavigation:
         if not page_verified:
             raise NavigationFailure(CONTACTS_PAGE_NOT_CONFIRMED)
         if self._foreground() != self.hwnd:
-            raise NavigationFailure(WINDOW_FOREGROUND_REJECTED)
+            raise NavigationFailure(OPERATOR_FOREGROUND_REQUIRED)
         started = time.perf_counter()
         self.last_popup_timing = {}
         self.last_popup_status = PROFILE_POPUP_UNRESOLVED

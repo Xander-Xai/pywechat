@@ -780,13 +780,20 @@ class Navigator():
             if not is_maximize:
                 win32gui.SendMessage(hwnd, win32con.WM_SYSCOMMAND, win32con.SC_RESTORE,0)
             from .visual_navigation import (
-                WINDOW_FOREGROUND_REJECTED,
+                AUTO_FOREGROUND_READY,
                 NavigationFailure,
+                foreground_acquisition_state,
                 foreground_wechat_window,
             )
 
-            if not foreground_wechat_window(hwnd):
-                raise NavigationFailure(WINDOW_FOREGROUND_REJECTED)
+            foreground_ready = foreground_wechat_window(hwnd)
+            foreground_status = foreground_acquisition_state(
+                target_is_foreground=False,
+                auto_request_succeeded=foreground_ready,
+                operator_fallback_enabled=True,
+            )
+            if foreground_status != AUTO_FOREGROUND_READY:
+                raise NavigationFailure(foreground_status)
             offline_button=main_window.child_window(**Buttons.OffLineButton)
             try:
                 offline=offline_button.exists(timeout=0.1)
@@ -1168,10 +1175,11 @@ class Navigator():
             is_maximize=GlobalConfig.is_maximize
         main_window=Navigator.open_weixin(is_maximize=is_maximize)
         from .visual_navigation import (
+            AUTO_FOREGROUND_READY,
             NavigationFailure,
             VisualContactSession,
-            WINDOW_FOREGROUND_REJECTED,
             Win32VisualNavigation,
+            foreground_acquisition_state,
             foreground_wechat_window,
         )
         import win32con
@@ -1208,8 +1216,14 @@ class Navigator():
             pass
 
         win32gui.ShowWindow(main_window.handle,win32con.SW_RESTORE)
-        if not foreground_wechat_window(main_window.handle):
-            raise NavigationFailure(WINDOW_FOREGROUND_REJECTED)
+        foreground_ready = foreground_wechat_window(main_window.handle)
+        foreground_status = foreground_acquisition_state(
+            target_is_foreground=False,
+            auto_request_succeeded=foreground_ready,
+            operator_fallback_enabled=True,
+        )
+        if foreground_status != AUTO_FOREGROUND_READY:
+            raise NavigationFailure(foreground_status)
         evidence=navigator.open_contacts(
             uia_hint=uia_contacts_hint,
             uia_list_hint=uia_list_hint,
