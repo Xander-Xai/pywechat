@@ -1,0 +1,67 @@
+[
+  {
+    "昵称": "测试用户甲",
+    "微信号": "fixture_wx_alpha",
+    "微信号状态": "CONFIRMED",
+    "微信号来源": "TEST_SOURCE",
+    "地区": "TEST_REGION_A",
+    "备注": "TEST_REMARK_A",
+    "电话": "10000000001",
+    "标签": "TEST_TAG_A",
+    "来源": "TEST_SOURCE",
+    "描述": "TEST_DESCRIPTION_A",
+    "朋友权限": "TEST_PERMISSION_A",
+    "共同群聊": "TEST_GROUP_A",
+    "个性签名": "TEST_SIGNATURE_A"
+  },
+  {
+    "昵称": "测试用户\n换行",
+    "微信号": "fixture_wx_beta",
+    "微信号状态": "CONFIRMED",
+    "微信号来源": "TEST_SOURCE",
+    "地区": "TEST_REGION_B",
+    "备注": "TEST_REMARK_B",
+    "电话": "10000000002",
+    "标签": "TEST_TAG_B",
+    "来源": "TEST_SOURCE",
+    "个性签名": "TEST_SIGNATURE_B"
+  },
+  {
+    "昵称": "测试,用户\"乙",
+    "微信号": "fixture_wx_gamma",
+    "微信号状态": "CONFIRMED",
+    "微信号来源": "TEST_SOURCE",
+    "地区": "TEST_REGION_C",
+    "备注": "TEST_REMARK,\"乙",
+    "电话": "10000000003",
+    "标签": "TEST_TAG_C",
+    "来源": "TEST_SOURCE",
+    "描述": "TEST_DESCRIPTION_C"
+  },
+  {
+    "昵称": "测试用户丁",
+    "微信号": "",
+    "微信号状态": "NEED_REVIEW",
+    "微信号来源": "TEST_SOURCE",
+    "地区": "TEST_REGION_D",
+    "备注": "TEST_REMARK_D",
+    "电话": "TEST_PHONE_DELTA",
+    "标签": "TEST_TAG_D",
+    "来源": "TEST_SOURCE"
+  },
+  {
+    "昵称": "测试用户甲",
+    "微信号": "fixture_wx_alpha",
+    "微信号状态": "CONFIRMED",
+    "微信号来源": "TEST_SOURCE",
+    "地区": "TEST_REGION_A",
+    "备注": "TEST_REMARK_A",
+    "电话": "10000000001",
+    "标签": "TEST_TAG_A",
+    "来源": "TEST_SOURCE",
+    "描述": "TEST_DESCRIPTION_A",
+    "朋友权限": "TEST_PERMISSION_A",
+    "共同群聊": "TEST_GROUP_A",
+    "个性签名": "TEST_SIGNATURE_A"
+  }
+]
