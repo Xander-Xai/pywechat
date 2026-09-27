@@ -4,24 +4,24 @@ import pytest
 from PIL import Image, ImageDraw
 
 from pyweixin.visual_navigation import (
+    AUTO_FOREGROUND_READY,
+    AUTO_FOREGROUND_REJECTED,
+    CONTACT_PROFILE_NOT_FOUND,
     CONTACTS_LIST_REGION,
     CONTACTS_NAV_CENTER,
     CONTACTS_NAV_REGION,
-    CONTACT_PROFILE_NOT_FOUND,
     CONTACTS_PAGE_NOT_CONFIRMED,
-    AUTO_FOREGROUND_READY,
-    AUTO_FOREGROUND_REJECTED,
+    NAVIGATION_UNRESOLVED,
     OPERATOR_FOREGROUND_REQUIRED,
     PROFILE_POPUP_NOT_OPENED,
     PROFILE_POPUP_OPENED,
     PROFILE_POPUP_UNRESOLVED,
-    NAVIGATION_UNRESOLVED,
     AnchorMatch,
     FriendProfileSurface,
-    NormalizedRect,
     NavigationFailure,
-    WindowCoordinateMapper,
+    NormalizedRect,
     Win32VisualNavigation,
+    WindowCoordinateMapper,
     anchors_agree,
     confirm_contacts_page,
     detect_contact_rows,
@@ -32,8 +32,54 @@ from pyweixin.visual_navigation import (
     foreground_acquisition_state,
     has_profile_content,
     image_fingerprint,
+    is_weixin_foreground,
     select_popup_window,
 )
+
+
+def test_weixin_foreground_accepts_main_process_surfaces(monkeypatch):
+    import win32gui
+
+    monkeypatch.setattr(win32gui, "IsWindow", lambda hwnd: True)
+    assert is_weixin_foreground(
+        10,
+        100,
+        foreground_hwnd=11,
+        get_pid=lambda hwnd: 100 if hwnd in (10, 11) else 200,
+        get_owner=lambda hwnd: 0,
+        get_root=lambda hwnd: 10 if hwnd == 11 else hwnd,
+        get_root_owner=lambda hwnd: 10 if hwnd == 11 else hwnd,
+    )
+
+
+def test_weixin_foreground_accepts_owned_profile_window(monkeypatch):
+    import win32gui
+
+    monkeypatch.setattr(win32gui, "IsWindow", lambda hwnd: True)
+    assert is_weixin_foreground(
+        10,
+        100,
+        foreground_hwnd=20,
+        get_pid=lambda hwnd: 200 if hwnd == 20 else 100,
+        get_owner=lambda hwnd: 10 if hwnd == 20 else 0,
+        get_root=lambda hwnd: hwnd,
+        get_root_owner=lambda hwnd: 10 if hwnd == 20 else hwnd,
+    )
+
+
+def test_weixin_foreground_rejects_unrelated_process_and_window(monkeypatch):
+    import win32gui
+
+    monkeypatch.setattr(win32gui, "IsWindow", lambda hwnd: True)
+    assert not is_weixin_foreground(
+        10,
+        100,
+        foreground_hwnd=20,
+        get_pid=lambda hwnd: 200,
+        get_owner=lambda hwnd: 0,
+        get_root=lambda hwnd: hwnd,
+        get_root_owner=lambda hwnd: hwnd,
+    )
 
 
 @dataclass
@@ -76,6 +122,14 @@ def test_dpi_125_and_150_are_recorded_without_changing_normalized_positions():
         )
 
 
+def test_virtual_desktop_negative_origin_maps_secondary_monitor_coordinates():
+    mapper = WindowCoordinateMapper(
+        (-1920, 120, 0, 1200), (-1930, 90, 10, 1210), 144
+    )
+    assert mapper.to_screen(0.5, 0.5) == (-960, 660)
+    assert mapper.to_normalized(-960, 660) == (0.5, 0.5)
+
+
 def test_contacts_anchor_detects_icon_features_in_configured_region():
     match = detect_contacts_anchor(icon_fixture())
     assert match is not None
@@ -112,24 +166,35 @@ def test_contacts_anchor_accepts_ocr_label_when_bounded_to_sidebar():
 
 
 def test_contacts_page_confirmation_from_explicit_page_label():
-    evidence = confirm_contacts_page([Token("Groups", 0.9, ())])
-    assert evidence.confirmed and evidence.method == "ocr_page_label"
+    evidence = confirm_contacts_page(
+        [Token("Contacts", 0.9, ((150, 150), (250, 150), (250, 175), (150, 175)))],
+        image_size=(1000, 800),
+    )
+    assert evidence.confirmed and evidence.method == "contacts_group_heading"
 
 
 def test_new_friends_subpage_label_alone_does_not_confirm_contacts_root():
-    evidence = confirm_contacts_page([Token("New Friends", 0.9, ())])
+    evidence = confirm_contacts_page(
+        [Token("New Friends", 0.9, ((150, 150), (250, 150), (250, 175), (150, 175)))],
+        image_size=(1000, 800),
+    )
     assert not evidence.confirmed
 
 
 def test_contacts_page_confirmation_fails_without_independent_evidence():
-    evidence = confirm_contacts_page([Token("ordinary text", 0.9, ())])
+    evidence = confirm_contacts_page(
+        [Token("ordinary text", 0.9, ((150, 150), (250, 150), (250, 175), (150, 175)))],
+        image_size=(1000, 800),
+    )
     assert not evidence.confirmed
-    assert evidence.method == "insufficient_page_evidence"
+    assert evidence.method == "contacts_group_heading"
 
 
-def test_contacts_page_can_use_list_layout_plus_uia_hint():
-    evidence = confirm_contacts_page([], list_row_count=3, uia_list_hint=True)
-    assert evidence.confirmed and evidence.method == "visual_list+uia_hint"
+def test_list_layout_or_uia_hint_alone_cannot_confirm_contacts_page():
+    evidence = confirm_contacts_page(
+        [], list_row_count=3, uia_list_hint=True, image_size=(1000, 800)
+    )
+    assert not evidence.confirmed
 
 
 def test_contact_rows_are_detected_anonymously_from_list_roi():
@@ -179,7 +244,7 @@ def test_profile_roi_prefers_valid_uia_rectangle_and_rejects_invalid_hint():
     crop, _ = nav.profile_image(page_verified=True, uia_rect=(500, 150, 950, 650))
     assert crop.size == (450, 500)
     fallback, _ = nav.profile_image(page_verified=True, uia_rect=(5, 5, 10, 10))
-    assert fallback.size == (509, 588)
+    assert fallback.size == (468, 151)
 
 
 def test_profile_roi_rejects_unrelated_text_without_profile_evidence():
@@ -261,10 +326,15 @@ def test_visual_navigation_works_with_empty_uia_and_verifies_page_change():
         mapper=WindowCoordinateMapper((100, 100, 1000, 750), (90, 70, 1010, 780)),
     )
     # Page label and row are synthetic and contain no real contact data.
-    nav._recognize = lambda image: [Token("Groups", 0.9, ()), row]
+    # The Contacts group heading must be boxed inside the left-list heading
+    # region: single-source page evidence, no fallback heuristics.
+    nav._recognize = lambda image: [
+        Token("Contacts", 0.9, ((150, 100), (250, 100), (250, 125), (150, 125))),
+        row,
+    ]
     evidence = nav.open_contacts(uia_hint=False, uia_list_hint=False)
     assert evidence.confirmed
-    assert evidence.method == "ocr_page_label"
+    assert evidence.method == "contacts_group_heading"
     assert len(selected_clicks) == 1
     x_ratio, y_ratio = nav.mapper.to_normalized(*selected_clicks[0])
     assert NormalizedRect(*CONTACTS_NAV_REGION).contains(x_ratio, y_ratio)
@@ -650,8 +720,8 @@ def test_extraction_routes_popup_first_and_keeps_multiscan_diagnostic_only(
         def __init__(self, config):
             calls.append(("extractor_init", config))
 
-        def extract(self, image):
-            calls.append(("extract", image))
+        def extract(self, image, **kwargs):
+            calls.append(("extract", image, kwargs))
             return FakeOcr()
 
     fake_package = types.ModuleType("wechat_ocr")
@@ -672,9 +742,17 @@ def test_extraction_routes_popup_first_and_keeps_multiscan_diagnostic_only(
 
     nav = object.__new__(Win32VisualNavigation)
     nav.last_stable_frame = None
+    frame = Image.new("RGB", (640, 480), "#dddddd")
+    nav.current_profile_frame = frame
     right_panel = Image.new("RGB", (100, 100), "white")
     popup = Image.new("RGB", (120, 140), "#eeeeee")
-    nav.profile_image = lambda **_kwargs: (right_panel, 0.01)
+    profile_inputs = []
+
+    def profile_image(**kwargs):
+        profile_inputs.append(kwargs["image"])
+        return right_panel, 0.01
+
+    nav.profile_image = profile_image
     nav.last_profile_tokens = []
     nav.open_friend_profile_visual = lambda **_kwargs: (
         FriendProfileSurface(
@@ -684,10 +762,23 @@ def test_extraction_routes_popup_first_and_keeps_multiscan_diagnostic_only(
         else (_ for _ in ()).throw(NavigationFailure(PROFILE_POPUP_NOT_OPENED))
     )
     nav.last_popup_timing = {}
-    result, _, _ = nav.extract_selected_profile(page_verified=True)
+    result, _, _ = nav.extract_selected_profile(page_verified=True, image=frame)
     assert result.status == "NOT_FOUND"
-    assert calls[-1] == ("extract", popup if popup_available else right_panel)
+    assert profile_inputs == [frame]
+    assert calls[-1] == (
+        "extract",
+        popup if popup_available else right_panel,
+        {"scale": 2, "allow_recrop": True},
+    )
     assert nav.last_popup_diagnostics["source"] == (
         "popup_hwnd" if popup_available else "none"
     )
     assert len([call for call in calls if call[0] == "extract"]) == 1
+
+
+def test_profile_extraction_requires_explicit_current_frame():
+    nav = object.__new__(Win32VisualNavigation)
+    nav.last_stable_frame = Image.new("RGB", (20, 20), "white")
+    with pytest.raises(NavigationFailure) as error:
+        nav.extract_selected_profile(page_verified=True)
+    assert error.value.status == "PROFILE_FRAME_REQUIRED"

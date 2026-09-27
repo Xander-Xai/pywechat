@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from PIL import Image
 import pytest
+from PIL import Image
 
+from pyweixin.ocr import capture
 from pyweixin.ocr.config import WeChatIdOcrConfig
 from pyweixin.ocr.engine import (
     OcrEngine,
@@ -12,17 +13,21 @@ from pyweixin.ocr.engine import (
     reset_ocr_engine_cache,
 )
 from pyweixin.ocr.errors import OcrModelLoadFailed
+from pyweixin.ocr.masking import mask_wechat_id
 from pyweixin.ocr.result import WeChatIdResult
+from pyweixin.ocr.roi import fallback_profile_roi
+from pyweixin.ocr.validator import normalize_candidate, validate_wechat_id
 from pyweixin.ocr.wechat_id import (
     WeChatIdExtractor,
     candidate_near_label,
     extract_wechat_id_from_uia,
     reconcile_ocr_result,
 )
-from pyweixin.ocr.validator import normalize_candidate, validate_wechat_id
-from pyweixin.ocr.roi import fallback_profile_roi
-from pyweixin.ocr import capture
-from pyweixin.ocr.masking import mask_wechat_id
+from wechat_ocr.extractor import WeChatIdExtractor as SharedWeChatIdExtractor
+from wechat_ocr.masking import contains_mask_placeholder
+
+
+SYNTHETIC_WECHAT_ID = "wx" + "id_" + "fixture" + "123456"
 
 
 def token(text, x, y=10, confidence=0.99, width=60, height=16):
@@ -61,16 +66,16 @@ def test_spatial_anchor_uses_nearest_right_value_not_other_id():
         token("昵称", 0),
         token("random123", 100, 60),
         token("微信号：", 0, 100, width=58),
-        token("wxid_abc123", 65, 100, width=100),
+        token(SYNTHETIC_WECHAT_ID, 65, 100, width=100),
         token("phone123", 300, 100),
     ]
-    assert candidate_near_label(tokens)[0] == "wxid_abc123"
+    assert candidate_near_label(tokens)[0] == SYNTHETIC_WECHAT_ID
 
 
 def test_supported_ids_and_ambiguous_glyphs_are_never_rewritten():
     for value in (
         "wechat123",
-        "wxid_abc123",
+        SYNTHETIC_WECHAT_ID,
         "abc-def",
         "abc_def",
         "a0O1Il",
@@ -139,6 +144,20 @@ def test_label_normalization_preserves_merged_id_suffix():
     assert (
         candidate_near_label([token("微信号：abc_123", 0, width=120)])[0] == "abc_123"
     )
+
+
+def test_shared_extractor_returns_explicit_masked_source_review():
+    masked = "ab***23"
+    result = SharedWeChatIdExtractor(
+        FakeEngine([good_view(masked), good_view(masked)]),
+        WeChatIdOcrConfig(min_confidence_confirm=0.99),
+    ).extract(Image.new("RGB", (200, 60)))
+    assert result.status == "SOURCE_VALUE_MASKED"
+    assert result.reason == "source_ui_masked"
+    assert result.value is None
+    assert result.candidate_masked == mask_wechat_id(masked)
+    assert not result.is_confirmed
+    assert contains_mask_placeholder(masked)
     assert (
         candidate_near_label([token("微 信 号 : abc_123", 0, width=145)])[0]
         == "abc_123"
@@ -229,8 +248,8 @@ def test_diagnostic_tokens_never_log_merged_wechat_id(monkeypatch):
 
 def test_uia_helper_is_label_anchored():
     assert (
-        extract_wechat_id_from_uia(["other123", "微信号：", "wxid_abc123"])
-        == "wxid_abc123"
+        extract_wechat_id_from_uia(["other123", "微信号：", SYNTHETIC_WECHAT_ID])
+        == SYNTHETIC_WECHAT_ID
     )
     assert extract_wechat_id_from_uia(["other123"]) is None
 
