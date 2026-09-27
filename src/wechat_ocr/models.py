@@ -22,6 +22,7 @@ Status = Literal[
     "OCR_VIEW_DISAGREEMENT",
     "OCR_UIA_DISAGREEMENT",
     "WECHAT_ID_NOT_VISIBLE",
+    "SOURCE_VALUE_MASKED",
 ]
 Source = Literal["ocr", "ocr+uia", "uia", "none"]
 
@@ -55,6 +56,7 @@ class WeChatIdResult:
     risky_chars: list[str] = field(default_factory=list)
     diagnostics: list[str] = field(default_factory=list)
     view_diagnostics: list[dict[str, object]] = field(default_factory=list)
+    candidate_masked: str = ""
 
     @property
     def is_confirmed(self) -> bool:
@@ -63,9 +65,12 @@ class WeChatIdResult:
 
     def to_metadata(self) -> dict[str, object]:
         """Flat dict for CSV/TXT metadata columns. Contains no full ID."""
-        return {
+        metadata = {
             "status": self.status,
             "source": self.source,
             "confidence": "" if self.confidence is None else f"{self.confidence:.3f}",
             "reason": self.reason or "",
         }
+        if self.candidate_masked:
+            metadata["candidate_masked"] = self.candidate_masked
+        return metadata

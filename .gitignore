@@ -4,7 +4,7 @@
 .idea/
 # test scripts
 probe*.py
-test_*.py
+/test_*.py
 dump_*.py
 ui_tree_*.txt
 _install_*.py
@@ -19,8 +19,26 @@ logs/
 .pytest_cache/
 # local virtualenv (upstream only had "*.venv", which does not match ".venv/")
 .venv/
-# contact exporter tests are versioned despite the upstream test_*.py pattern
+# Keep contact exporter tests and fixtures versioned.
 !tests/
 !tests/*.py
 !tests/fixtures/
 !tests/fixtures/*.json
+
+# Local contact exports and runtime state (including paths outside output/).
+wechat_contacts_*.csv
+wechat_contacts_*.txt
+*_review.csv
+fixed_geometry_checkpoint.json
+live_status.json
+*.progress.json
+supervisor_status.json
+
+# Local diagnostic captures from the Navigation V2 investigation.
+/wechat_return.png
+/pics/current_state*.png
+/pics/current_state_small.jpg
+/pics/profile_header.png
+/pics/t_crop_*.png
+/pics/screen_ocr.txt
+/pics/zone_*.txt

@@ -1199,7 +1199,8 @@ class Navigator():
                 if uia_list_hint:
                     try:
                         navigator.confirm_current_contacts(uia_list_hint=True)
-                        contacts_list.type_keys('{HOME}')
+                        # Preserve the currently selected contact. Batch
+                        # export starts here and advances one item at a time.
                         return contacts_list,main_window
                     except NavigationFailure:
                         pass

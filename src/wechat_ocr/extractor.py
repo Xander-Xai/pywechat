@@ -10,10 +10,10 @@ from typing import Iterable, Sequence
 from .config import DEFAULT_CONFIG, WeChatIdOcrConfig
 from .engine import OcrToken, get_ocr_engine
 from .errors import OcrError
-from .preprocess import recognition_views
+from .masking import contains_mask_placeholder, mask_wechat_id
 from .models import WeChatIdResult
+from .preprocess import recognition_views
 from .validator import normalize_candidate, risky_characters, validate_wechat_id
-from .masking import mask_wechat_id
 
 _LABEL = re.compile(
     r"^(?:微\s*信\s*号|微信\s*ID|WeChat\s*ID|Weixin\s*ID)\s*([:：])?\s*(.*)$", re.I
@@ -182,6 +182,54 @@ def candidate_near_label(
     return best[2], best[3]
 
 
+def recrop_labeled_value(
+    image, tokens: Sequence[OcrToken], config: WeChatIdOcrConfig | None = None
+) -> tuple[str, float] | None:
+    """Label-anchored local value re-recognition on one header frame.
+
+    When the full-header pass found the label but the value reading was not
+    confirmed, crop just the value line right of the label, upscale, and run
+    the recognizer again on the tight crop. The candidate must validate;
+    nothing is rewritten or guessed. Returns ``(candidate, confidence)`` or
+    None when no label, no valid value, or the two views disagree.
+    """
+    cfg = config or DEFAULT_CONFIG
+    label_token = None
+    for token in tokens:
+        is_label, _ = _label_token(token.text)
+        if is_label:
+            label_token = token
+            break
+    if label_token is None:
+        return None
+    width, height = image.size
+    value_left = label_token.right
+    value_right = min(width, int(value_left + max(200, round(width * 0.16))))
+    # Vertical band around the label row (value rarely differs in height).
+    top = max(0, int(label_token.top - 0.006 * height))
+    bottom = min(height, int(label_token.bottom + 0.006 * height))
+    if value_right <= value_left + 8 or bottom <= top + 4:
+        return None
+    crop = image.crop((value_left, top, value_right, bottom))
+    if crop.width < 16 or crop.height < 8:
+        return None
+    engine = get_ocr_engine(cfg)
+    candidates: list[tuple[str, float]] = []
+    view_a, view_b = recognition_views(crop, scale=2)
+    for view in (view_a, view_b):
+        for token in engine.recognize(view):
+            value = normalize_candidate(token.text, cfg.labels)
+            if value and validate_wechat_id(value, cfg).valid:
+                candidates.append((value, token.confidence))
+    if not candidates:
+        return None
+    best = max(candidates, key=lambda item: item[1])
+    if any(item[0] != best[0] for item in candidates):
+        # Multi-view disagreement inside the recrop: fail closed.
+        return None
+    return best[0], best[1]
+
+
 def extract_wechat_id_from_uia(
     texts: Iterable[str], config: WeChatIdOcrConfig | None = None
 ) -> str | None:
@@ -205,25 +253,43 @@ class WeChatIdExtractor:
         self.config = config or DEFAULT_CONFIG
         self._engine = engine
 
-    def extract(self, image, *, ui_candidate: str | None = None) -> WeChatIdResult:
+    def extract(
+        self, image, *, ui_candidate: str | None = None, scale: int = 2,
+        allow_recrop: bool = True,
+    ) -> WeChatIdResult:
         if not self.config.ocr_enabled or not self.config.ocr_primary:
             return WeChatIdResult(status="OCR_FAILED", reason="ocr_primary_disabled")
         candidates: list[str | None] = []
         scores: list[float | None] = []
         view_diagnostics: list[dict[str, object]] = []
         recognized_views: list[list[OcrToken]] = []
+        label_anchored = False
         try:
             engine = self._engine or get_ocr_engine(self.config)
-            for view in recognition_views(image):
+            for view in recognition_views(image, scale=scale):
                 tokens = engine.recognize(view)
                 recognized_views.append(tokens)
                 evidence = label_diagnostics(tokens)
                 value, score = candidate_near_label(tokens, self.config)
+                if value and contains_mask_placeholder(value):
+                    return WeChatIdResult(
+                        value=None,
+                        status="SOURCE_VALUE_MASKED",
+                        source="ocr",
+                        confidence=score,
+                        reason="source_ui_masked",
+                        diagnostics=["SOURCE_VALUE_MASKED"],
+                        view_diagnostics=[evidence],
+                        candidate_masked=mask_wechat_id(value),
+                    )
                 if value and not validate_wechat_id(value, self.config).valid:
                     value = None
                 candidates.append(value)
                 scores.append(score)
                 view_diagnostics.append(evidence)
+                label_anchored = label_anchored or bool(
+                    evidence.get("has_wechat_label")
+                )
         except OcrError as exc:
             return WeChatIdResult(
                 status="OCR_FAILED",
@@ -252,6 +318,71 @@ class WeChatIdExtractor:
             ui_candidate,
             self.config,
         )
+        if allow_recrop and result.status != "CONFIRMED" and label_anchored and recognized_views:
+            # Final fail-closed stage: label-anchored local value re-read on a
+            # tight 2x crop. Only upgrades to CONFIRMED when the recrop agrees
+            # with every full-header view that produced a candidate.
+            recrop = recrop_labeled_value(image, recognized_views[0], self.config)
+            if recrop is not None:
+                recrop_value, recrop_score = recrop
+                full_values = [c for c in candidates if c]
+                if full_values and any(v != recrop_value for v in full_values):
+                    result = WeChatIdResult(
+                        value=None,
+                        status="NEED_REVIEW",
+                        source="ocr+recrop",
+                        confidence=None,
+                        ocr_candidates=candidates,
+                        ui_candidate=ui_candidate,
+                        reason="view_disagreement",
+                        diagnostics=[
+                            "OCR_DISAGREEMENT",
+                            "RECROP_DISAGREEMENT",
+                            "NEED_REVIEW",
+                        ],
+                        view_diagnostics=list(view_diagnostics),
+                    )
+                elif ui_candidate and ui_candidate != recrop_value:
+                    result = WeChatIdResult(
+                        value=None,
+                        status="NEED_REVIEW",
+                        source="ocr+uia",
+                        confidence=recrop_score,
+                        ocr_candidates=candidates,
+                        ui_candidate=ui_candidate,
+                        reason="uia_mismatch",
+                        diagnostics=[
+                            "RECROP_CONSENSUS",
+                            "OCR_UIA_DISAGREEMENT",
+                            "NEED_REVIEW",
+                        ],
+                        view_diagnostics=list(view_diagnostics),
+                    )
+                elif recrop_score >= self.config.min_confidence_confirm:
+                    result = WeChatIdResult(
+                        value=recrop_value,
+                        status="CONFIRMED",
+                        source="ocr+uia+recrop" if ui_candidate else "ocr+recrop",
+                        confidence=recrop_score,
+                        ocr_candidates=candidates,
+                        ui_candidate=ui_candidate,
+                        risky_chars=risky_characters(recrop_value),
+                        reason="local_recrop_consensus",
+                        diagnostics=["RECROP_CONSENSUS"],
+                        view_diagnostics=list(view_diagnostics),
+                    )
+                else:
+                    result = WeChatIdResult(
+                        value=recrop_value,
+                        status="NEED_REVIEW",
+                        source="ocr+recrop",
+                        confidence=recrop_score,
+                        ocr_candidates=candidates,
+                        ui_candidate=ui_candidate,
+                        reason="low_confidence",
+                        diagnostics=["RECROP_CANDIDATE", "NEED_REVIEW"],
+                        view_diagnostics=list(view_diagnostics),
+                    )
         if result.status == "NOT_FOUND":
             labels = [bool(item["has_wechat_label"]) for item in view_diagnostics]
             any_text = any(

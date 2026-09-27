@@ -40,6 +40,87 @@ CONTACTS_NAV_CENTER = (0.047, 0.292)
 CONTACTS_NAV_MIN_CONFIDENCE = 0.62
 CONTACTS_LIST_REGION = (0.105, 0.20, 0.43, 0.98)
 PROFILE_FALLBACK_REGION = (0.43, 0.035, 0.995, 0.94)
+# Right-panel top region holding avatar, nickname, WeChat ID, and region.
+# Calibrated against the live Weixin 4.x profile header on 1936x1048:
+# nickname ~y 0.125, wechat-id label ~y 0.140..0.16, region ~y 0.155..0.175,
+# label column starts ~x 0.53. OCR here only; never covers Moments/signature.
+PROFILE_CHANGE_ROI = (0.40, 0.038, 0.92, 0.27)
+PROFILE_HEADER_REGION = PROFILE_CHANGE_ROI
+# OCR and movement verification share the same header crop.
+CONTACT_HEADER_ROI = PROFILE_CHANGE_ROI
+# Value crop right of the WeChat-ID label begins at the label's right edge;
+# this is its max right bound (label + value never exceed it on 1500-2200px).
+PROFILE_HEADER_VALUE_MAX_RIGHT = 0.88
+
+# Left strip of each contact row where the theme paints the selection bar.
+# Sequential path uses a green-bar marker to gate row clicks; tuned against
+# the live Weixin 4.x list (row height ~52px, selection bar ~6px wide).
+ROW_SELECTION_STRIP = (0.035, 0.17, 0.018)
+SELECTED_ROW_MIN_GREEN = 0.28
+
+
+def _row_selection_score(frame: Image.Image, y_ratio: float) -> float:
+    """Green-dominance of the selection strip at a row's y center.
+
+    Returns 0.0 when the strip is not green enough to count as selected.
+    """
+    width, height = frame.size
+    left, right, half_height = ROW_SELECTION_STRIP
+    list_left, _, list_right, _ = contacts_list_region(frame.size)
+    left = max(left, list_left)
+    right = min(right, list_right)
+    strip = (
+        round(left * width),
+        round((y_ratio - half_height) * height),
+        round(right * width),
+        round((y_ratio + half_height) * height),
+    )
+    if strip[2] <= strip[0] or strip[3] <= strip[1]:
+        return 0.0
+    crop = frame.crop(strip).convert("RGB").resize((24, 5))
+    pixels = list(crop.getdata())
+    greens = 0.0
+    for r, g, b in pixels:
+        # The Weixin selected-row fill is a pale green on this client, so its
+        # green channel is only modestly higher than red and blue.
+        if g > 80 and g > r * 1.04 and g > b * 1.02:
+            greens += 1.0
+    return greens / max(1, len(pixels))
+
+
+def selected_row_y(frame: Image.Image, rows: Sequence[object]) -> float:
+    """Y center of the currently green-selected row among ``rows``.
+
+    Rows carry ``y_ratio``; each row's selection strip is scored and the
+    winning row is returned. Returns -1.0 when no row passes the gate.
+    """
+    best, best_y = 0.0, -1.0
+    for row in rows:
+        score = _row_selection_score(frame, getattr(row, "y_ratio", 0.0))
+        if score > best:
+            best, best_y = score, getattr(row, "y_ratio", 0.0)
+    return best_y if best >= SELECTED_ROW_MIN_GREEN else -1.0
+
+
+def contacts_list_region(image_size: tuple[int, int]) -> tuple[float, float, float, float]:
+    """Return the contacts-column ROI for the current Weixin window width."""
+    width, _ = image_size
+    # Weixin keeps the navigation rail and contact list near fixed pixel widths
+    # on wide displays; the standard normalized ROI otherwise hits empty space.
+    if width >= 1500:
+        return (0.035, 0.05, 0.17, 0.98)
+    return CONTACTS_LIST_REGION
+
+
+def contact_avatar_region(image_size: tuple[int, int]) -> tuple[float, float]:
+    width, _ = image_size
+    return (0.052, 0.074) if width >= 1500 else (0.11, 0.18)
+
+
+def contacts_navigation_crop(image: Image.Image) -> Image.Image:
+    """Crop OCR to the navigation and contact-list strip only."""
+    right = contacts_list_region(image.size)[2] + 0.03
+    return image.crop((0, 0, min(image.width, max(1, round(right * image.width))), image.height))
 CONTACTS_PAGE_TERMS = (
     "\u65b0\u7684\u670b\u53cb",
     "\u7fa4\u804a",
@@ -67,6 +148,7 @@ CONTACTS_ROOT_TERMS = (
     "\u6a19\u7c64",
     "\u516c\u773e\u865f",
 )
+CONTACTS_GROUP_TERMS = ("\u8054\u7cfb\u4eba", "\u806f\u7d61\u4eba", "Contacts")
 PROFILE_FIELD_TERMS = (
     "\u5fae\u4fe1\u53f7",
     "\u6635\u79f0",
@@ -96,6 +178,9 @@ CONTACTS_CATEGORY_TERMS = (
     "Tags",
     "Official Accounts",
     "WeCom Contacts",
+    "\u8054\u7cfb\u4eba",
+    "\u806f\u7d61\u4eba",
+    "Contacts",
     "\u65b0\u7684\u670b\u53cb",
     "\u7fa4\u7d44\u804a\u5929",
     "\u6a19\u7c64",
@@ -223,6 +308,126 @@ def focus_window_with_bounded_retry(
         if attempt + 1 < min(3, max(1, attempts)):
             wait(0.12)
     return False
+
+
+def is_weixin_foreground(
+    target_hwnd: int,
+    target_pid: int | None = None,
+    *,
+    foreground_hwnd: int | None = None,
+    get_pid: Callable[[int], int] | None = None,
+    get_owner: Callable[[int], int] | None = None,
+    get_root: Callable[[int], int] | None = None,
+    get_root_owner: Callable[[int], int] | None = None,
+) -> bool:
+    """Accept the main Weixin HWND, same-process surfaces, and owned windows."""
+    import win32con
+    import win32gui
+    import win32process
+
+    if not target_hwnd:
+        return False
+    foreground_hwnd = (
+        win32gui.GetForegroundWindow() if foreground_hwnd is None else foreground_hwnd
+    )
+    if not foreground_hwnd or not win32gui.IsWindow(target_hwnd):
+        return False
+    pid_for = get_pid or (
+        lambda handle: int(win32process.GetWindowThreadProcessId(handle)[1])
+    )
+    owner_for = get_owner or (
+        lambda handle: int(win32gui.GetWindow(handle, win32con.GW_OWNER) or 0)
+    )
+    root_for = get_root or (
+        lambda handle: int(win32gui.GetAncestor(handle, win32con.GA_ROOT) or 0)
+    )
+    root_owner_for = get_root_owner or (
+        lambda handle: int(win32gui.GetAncestor(handle, win32con.GA_ROOTOWNER) or 0)
+    )
+    try:
+        target_pid = int(target_pid or pid_for(target_hwnd))
+        if int(pid_for(foreground_hwnd)) == target_pid:
+            return True
+    except Exception:
+        return False
+
+    related = {
+        int(foreground_hwnd),
+        int(owner_for(foreground_hwnd) or 0),
+        int(root_for(foreground_hwnd) or 0),
+        int(root_owner_for(foreground_hwnd) or 0),
+    }
+    if int(target_hwnd) in related:
+        return True
+
+    # Include intermediate owner links used by Qt and embedded native surfaces.
+    current = int(foreground_hwnd)
+    visited: set[int] = set()
+    for _ in range(8):
+        if not current or current in visited:
+            break
+        visited.add(current)
+        try:
+            current = int(owner_for(current) or 0)
+        except Exception:
+            break
+        if current == target_hwnd:
+            return True
+        if current:
+            try:
+                if int(pid_for(current)) == target_pid:
+                    return True
+            except Exception:
+                pass
+    return False
+
+
+def foreground_weixin_diagnostics(target_hwnd: int) -> dict[str, object]:
+    """Return non-contact foreground/window-family metadata for diagnosis."""
+    import win32con
+    import win32gui
+    import win32process
+
+    foreground = int(win32gui.GetForegroundWindow() or 0)
+    target_thread, target_pid = (
+        win32process.GetWindowThreadProcessId(target_hwnd) if target_hwnd else (0, 0)
+    )
+    foreground_thread, foreground_pid = (
+        win32process.GetWindowThreadProcessId(foreground) if foreground else (0, 0)
+    )
+    owner = (
+        int(win32gui.GetWindow(foreground, win32con.GW_OWNER) or 0) if foreground else 0
+    )
+    root = (
+        int(win32gui.GetAncestor(foreground, win32con.GA_ROOT) or 0)
+        if foreground
+        else 0
+    )
+    root_owner = (
+        int(win32gui.GetAncestor(foreground, win32con.GA_ROOTOWNER) or 0)
+        if foreground
+        else 0
+    )
+    same_pid = bool(target_pid and foreground_pid == target_pid)
+    owner_match = target_hwnd in {owner, root, root_owner}
+    return {
+        "target_weixin_hwnd": int(target_hwnd or 0),
+        "target_weixin_pid": int(target_pid or 0),
+        "target_thread_id": int(target_thread or 0),
+        "target_class": win32gui.GetClassName(target_hwnd) if target_hwnd else "",
+        "foreground_hwnd": foreground,
+        "foreground_pid": int(foreground_pid or 0),
+        "foreground_thread_id": int(foreground_thread or 0),
+        "foreground_process_id_matches_target": same_pid,
+        "foreground_owner_hwnd": owner,
+        "foreground_root_hwnd": root,
+        "foreground_root_owner_hwnd": root_owner,
+        "foreground_is_target_main_hwnd": foreground == target_hwnd,
+        "foreground_is_owned_or_rooted_in_target": owner_match,
+        "weixin_foreground": is_weixin_foreground(
+            target_hwnd, int(target_pid or 0), foreground_hwnd=foreground
+        ),
+    }
 
 
 def detect_friend_avatar_anchor(
@@ -353,20 +558,52 @@ def foreground_wechat_window(
     """Win32 foreground helper with a bounded restore/raise/verify cycle."""
     import win32con
     import win32gui
+    import win32process
+    import win32api
+    import ctypes
 
     def foreground_root() -> int:
         current = win32gui.GetForegroundWindow()
         return win32gui.GetAncestor(current, win32con.GA_ROOT) if current else 0
 
-    if foreground_root() == hwnd:
+    def foreground_match_or_root() -> int:
+        return hwnd if is_weixin_foreground(hwnd) else foreground_root()
+
+    def raise_with_input_attachment(target: int) -> None:
+        foreground = win32gui.GetForegroundWindow()
+        foreground_thread = (
+            win32process.GetWindowThreadProcessId(foreground)[0]
+            if foreground
+            else 0
+        )
+        current_thread = win32api.GetCurrentThreadId()
+        attached = False
+        try:
+            if foreground_thread and foreground_thread != current_thread:
+                attached = bool(
+                    ctypes.windll.user32.AttachThreadInput(
+                        current_thread, foreground_thread, True
+                    )
+                )
+            if win32gui.IsIconic(target):
+                win32gui.ShowWindow(target, win32con.SW_RESTORE)
+            win32gui.BringWindowToTop(target)
+            win32gui.SetForegroundWindow(target)
+        finally:
+            if attached:
+                ctypes.windll.user32.AttachThreadInput(
+                    current_thread, foreground_thread, False
+                )
+
+    if is_weixin_foreground(hwnd):
         return True
     return focus_window_with_bounded_retry(
         hwnd,
         is_iconic=win32gui.IsIconic,
         show_restore=lambda target: win32gui.ShowWindow(target, win32con.SW_RESTORE),
-        bring_to_top=win32gui.BringWindowToTop,
-        set_foreground=win32gui.SetForegroundWindow,
-        get_foreground=foreground_root,
+        bring_to_top=lambda target: None,
+        set_foreground=raise_with_input_attachment,
+        get_foreground=foreground_match_or_root,
         wait=wait,
         attempts=3,
     )
@@ -510,35 +747,46 @@ def confirm_contacts_page(
     uia_list_hint: bool = False,
     image_size: tuple[int, int] | None = None,
 ) -> PageEvidence:
-    hints = 0
-    width, height = image_size or (0, 0)
+    del list_row_count, uia_list_hint
+    if image_size is None:
+        return PageEvidence(False, "invalid_image_size", 0)
+    return confirm_contacts_group(tokens, image_size)
+
+
+def confirm_contacts_group(
+    tokens: Iterable[object], image_size: tuple[int, int]
+) -> PageEvidence:
+    """Require the explicit Contacts section heading in the left list pane."""
+    width, height = image_size
+    if width <= 0 or height <= 0:
+        return PageEvidence(False, "invalid_image_size", 0)
+    left, _, right, bottom = contacts_list_region(image_size)
+    heading_region = NormalizedRect(left, 0.14, right, min(0.40, bottom))
+    matches = 0
     for token in tokens:
-        word = str(getattr(token, "text", "")).casefold()
-        if not any(term.casefold() in word for term in CONTACTS_ROOT_TERMS):
+        text = str(getattr(token, "text", "")).strip().casefold()
+        if not any(term.casefold() in text for term in CONTACTS_GROUP_TERMS):
             continue
         box = getattr(token, "box", None)
-        if box and width > 0 and height > 0:
-            x = sum(point[0] for point in box) / (4 * width)
-            y = sum(point[1] for point in box) / (4 * height)
-            if not NormalizedRect(*CONTACTS_LIST_REGION).contains(x, y):
-                continue
-        hints += 1
-    if hints:
-        return PageEvidence(True, "ocr_page_label", hints)
-    if list_row_count >= 2 and uia_list_hint:
-        return PageEvidence(True, "visual_list+uia_hint", list_row_count)
-    return PageEvidence(False, "insufficient_page_evidence", hints)
+        if not box:
+            continue
+        x = sum(point[0] for point in box) / (4 * width)
+        y = sum(point[1] for point in box) / (4 * height)
+        if heading_region.contains(x, y):
+            matches += 1
+    return PageEvidence(matches > 0, "contacts_group_heading", matches)
 
 
 def detect_contact_rows(
     tokens: Sequence[object],
     image_size: tuple[int, int],
-    region: NormalizedRect = NormalizedRect(*CONTACTS_LIST_REGION),
+    region: NormalizedRect | None = None,
 ) -> list[float]:
     """Return anonymized normalized row centers from OCR text boxes."""
     width, height = image_size
     if width <= 0 or height <= 0:
         return []
+    region = region or NormalizedRect(*contacts_list_region(image_size))
     centers = []
     category_bottoms = []
     eligible = []
@@ -570,6 +818,170 @@ def detect_contact_rows(
     return rows
 
 
+@dataclass(frozen=True)
+class ContactRowInfo:
+    """One detected contact row: anonymized geometry plus its OCR name text.
+
+    ``name_text`` is kept only long enough to build a non-PII fingerprint;
+    it is never written to checkpoints, logs, or export files.
+    """
+
+    y_ratio: float
+    name_text: str
+    name_left_ratio: float = 0.0
+
+
+def _row_label_text(word: str, region_left: float) -> str:
+    """Keep a stable normalized row label for fingerprinting.
+
+    Drops pure category headings (they are list headers, not rows) and any
+    trailing per-group counts like ``9939`` attached by the recognizer.
+    """
+    lowered = word.casefold().strip()
+    if any(term.casefold() in lowered for term in CONTACTS_CATEGORY_TERMS):
+        return ""
+    text = word.strip()
+    # Trailing group-count digits ("¤带数字") are not part of a name.
+    return text
+
+
+def detect_contact_rows_rich(
+    tokens: Sequence[object],
+    image_size: tuple[int, int],
+    region: NormalizedRect | None = None,
+) -> list[ContactRowInfo]:
+    """Return contact rows with name text, ordered top to bottom.
+
+    Same conservative geometry as :func:`detect_contact_rows` (never below
+    the last category heading), but keeps the anonymized name text so the
+    caller can build a content-based fingerprint. Never includes category
+    headings (群聊/公众号/企业微信/联系人/星标朋友...) as rows.
+    """
+    width, height = image_size
+    if width <= 0 or height <= 0:
+        return []
+    region = region or NormalizedRect(*contacts_list_region(image_size))
+    category_bottoms: list[float] = []
+    eligible: list[tuple] = []
+    for token in tokens:
+        box = getattr(token, "box", None)
+        if not box:
+            continue
+        cx = sum(point[0] for point in box) / (4 * width)
+        cy = sum(point[1] for point in box) / (4 * height)
+        word = str(getattr(token, "text", "")).casefold()
+        if region.contains(cx, cy) and any(
+            term.casefold() in word for term in CONTACTS_CATEGORY_TERMS
+        ):
+            category_bottoms.append(max(point[1] for point in box) / height)
+        eligible.append((token, box, cx, cy, word))
+    minimum_y = max(region.top, 0.48)
+    if category_bottoms:
+        minimum_y = max(region.top, max(category_bottoms) + 0.02)
+    grouped: dict[float, list] = {}
+    for token, box, cx, cy, word in eligible:
+        if any(term.casefold() in word for term in CONTACTS_PAGE_TERMS):
+            continue
+        if region.contains(cx, cy) and minimum_y <= cy <= 0.96:
+            label = _row_label_text(str(getattr(token, "text", "")), region.left)
+            if not label:
+                continue
+            center = round(cy, 6)
+            grouped.setdefault(center, []).append(
+                (token, box, cx, cy, label)
+            )
+    rows: list[ContactRowInfo] = []
+    for center in sorted(grouped):
+        if rows and abs(center - rows[-1].y_ratio) <= 0.025:
+            continue
+        members = grouped[center]
+        member = max(members, key=lambda item: len(item[4]))
+        rows.append(
+            ContactRowInfo(
+                y_ratio=center,
+                name_text=member[4],
+                name_left_ratio=member[2],
+            )
+        )
+    return rows
+
+
+def avatar_perceptual_hash(frame: Image.Image, y_ratio: float) -> str:
+    """Color-aware avatar dHash for a row, invariant to row position.
+
+    The crop is centered on the avatar computed from the current list
+    geometry. grayscale + autocontrast keep the hash stable across the
+    selected/unselected row background, and the differential step makes it
+    insensitive to uniform background bleeding at the crop edges. The
+    per-channel dHash pattern adds the avatar's colors, so two flat-colored
+    avatars of identical shape (common initials-style logos) still hash
+    differently.
+    """
+    from PIL import ImageOps
+
+    width, height = frame.size
+    avatar_left, avatar_right = contact_avatar_region(frame.size)
+    center_x = (avatar_left + avatar_right) / 2.0
+    avatar_size = min(26.0, (avatar_right - avatar_left) * 0.48)
+    box = (
+        round((center_x - avatar_size / 2) * width),
+        round((y_ratio - avatar_size / 2) * height),
+        round((center_x + avatar_size / 2) * width),
+        round((y_ratio + avatar_size / 2) * height),
+    )
+    crop = frame.crop(box)
+    if crop.width < 8 or crop.height < 8:
+        return ""
+    gray = _dhash(ImageOps.autocontrast(crop.convert("L")).resize((9, 8)))
+    bands = crop.split()
+    color = "".join(
+        _dhash(ImageOps.autocontrast(band).resize((9, 8))) for band in bands
+    )
+    return f"{gray}{color}"
+
+
+def _dhash(gray: Image.Image) -> str:
+    pixels = list(gray.getdata())
+    signature = 0
+    for row in range(8):
+        base = row * 9
+        for col in range(8):
+            signature = (signature << 1) | int(
+                pixels[base + col] >= pixels[base + col + 1]
+            )
+    return f"{signature:016x}"
+
+
+def profile_hash(image: Image.Image, region: tuple = PROFILE_HEADER_REGION) -> str:
+    """Stable perceptual hash of the profile header (change gate evidence).
+
+    Compares hash values, never stored pixels. The header region contains
+    avatar + nickname + wechat-id; two contacts sharing every pixel here
+    cannot be distinguished visually, which is exactly the case the change
+    gate must force a retry instead of trusting.
+    """
+    width, height = image.size
+    box = (
+        round(region[0] * width),
+        round(region[1] * height),
+        round(region[2] * width),
+        round(region[3] * height),
+    )
+    if box[2] <= box[0] or box[3] <= box[1]:
+        return ""
+    gray = image.crop(box).convert("L")
+    low, high = gray.getextrema()
+    if high - low < 12:
+        # Near-uniform header (e.g. blank panel): hash is not meaningful but
+        # still deterministic so repeated OCR of the same blank stays equal.
+        return hashlib.sha256(gray.resize((32, 32)).tobytes()).hexdigest()
+    from PIL import ImageOps
+
+    return hashlib.sha256(
+        ImageOps.autocontrast(gray).resize((64, 32)).tobytes()
+    ).hexdigest()
+
+
 class Win32VisualNavigation:
     """Win32 window-bound visual navigation; captures remain in memory."""
 
@@ -592,7 +1004,7 @@ class Win32VisualNavigation:
         self._recognize = recognize or self._shared_recognize
         self._screenshot = screenshot or self._capture_client
         self._click = click or self._click_once
-        self._foreground = foreground or self._foreground_root
+        self._foreground = foreground or self._foreground_weixin_or_root
         self._popup_windows = popup_windows or self._enumerate_profile_popups
         self._capture_window = capture_window or self._capture_window_client
         self._wait = wait
@@ -600,8 +1012,8 @@ class Win32VisualNavigation:
         self.mapper = mapper or self._window_mapper()
 
     def _window_mapper(self) -> WindowCoordinateMapper:
-        import win32gui
         import ctypes
+        import win32gui
 
         if not win32gui.IsWindow(self.hwnd):
             raise NavigationFailure(WINDOW_NOT_FOUND)
@@ -611,7 +1023,7 @@ class Win32VisualNavigation:
         right_bottom = win32gui.ClientToScreen(self.hwnd, (client[2], client[3]))
         try:
             dpi = int(ctypes.windll.user32.GetDpiForWindow(self.hwnd)) or 96
-        except Exception:
+        except (AttributeError, OSError, TypeError, ValueError):
             dpi = 96
         return WindowCoordinateMapper(
             (left_top[0], left_top[1], right_bottom[0], right_bottom[1]),
@@ -621,11 +1033,14 @@ class Win32VisualNavigation:
 
     @staticmethod
     def _foreground_root() -> int:
-        import win32gui
         import win32con
+        import win32gui
 
         hwnd = win32gui.GetForegroundWindow()
         return win32gui.GetAncestor(hwnd, win32con.GA_ROOT) if hwnd else 0
+
+    def _foreground_weixin_or_root(self) -> int:
+        return self.hwnd if is_weixin_foreground(self.hwnd) else self._foreground_root()
 
     def _capture_client(self, _hwnd: int) -> Image.Image:
         from PIL import ImageGrab
@@ -722,7 +1137,7 @@ class Win32VisualNavigation:
             raise NavigationFailure(
                 CONTACTS_PAGE_NOT_CONFIRMED, "screenshot did not change"
             )
-        tokens = self._tokens(after)
+        tokens = self._tokens(contacts_navigation_crop(after))
         rows = detect_contact_rows(tokens, after.size)
         page = confirm_contacts_page(
             tokens,
@@ -745,7 +1160,7 @@ class Win32VisualNavigation:
         """Verify an already-open Contacts page without clicking anything."""
         started = time.perf_counter()
         image = self._screenshot(self.hwnd)
-        tokens = self._tokens(image)
+        tokens = self._tokens(contacts_navigation_crop(image))
         rows = detect_contact_rows(tokens, image.size)
         page = confirm_contacts_page(
             tokens,
@@ -769,7 +1184,9 @@ class Win32VisualNavigation:
             raise NavigationFailure(CONTACTS_PAGE_NOT_CONFIRMED)
         started = time.perf_counter()
         image = self._screenshot(self.hwnd)
-        rows = detect_contact_rows(self._tokens(image), image.size)
+        rows = detect_contact_rows(
+            self._tokens(contacts_navigation_crop(image)), image.size
+        )
         self.last_contact_row_detect_seconds = time.perf_counter() - started
         return rows
 
@@ -790,8 +1207,9 @@ class Win32VisualNavigation:
         if contact_index > len(rows):
             raise NavigationFailure(CONTACT_LIST_NOT_FOUND)
         y_ratio = rows[contact_index - 1]
-        x_ratio = (CONTACTS_LIST_REGION[0] + CONTACTS_LIST_REGION[2]) / 2
-        region = NormalizedRect(*CONTACTS_LIST_REGION)
+        row_region = contacts_list_region(self.mapper.size)
+        x_ratio = (row_region[0] + row_region[2]) / 2
+        region = NormalizedRect(*row_region)
         # Fresh screenshot and OCR row revalidation before a single click.
         fresh = self._screenshot(self.hwnd)
         fresh_rows = detect_contact_rows(self._tokens(fresh), fresh.size)
@@ -839,7 +1257,7 @@ class Win32VisualNavigation:
                         "visible": True,
                     }
                 )
-            except Exception:
+            except Exception:  # noqa: BLE001, S110 - skip stale or inaccessible top-level windows.
                 pass
             return True
 
@@ -1094,6 +1512,8 @@ class Win32VisualNavigation:
                 )
                 if consecutive_stable >= 2:
                     self.last_stable_frame = current
+                    self.current_profile_frame = current
+                    self.current_profile_frame_hash = profile_hash(current)
                     return current, time.perf_counter() - started
             previous = current
         raise NavigationFailure(
@@ -1138,10 +1558,10 @@ class Win32VisualNavigation:
                 box = None
         if box is None:
             box = (
-                round(PROFILE_FALLBACK_REGION[0] * width),
-                round(PROFILE_FALLBACK_REGION[1] * height),
-                round(PROFILE_FALLBACK_REGION[2] * width),
-                round(PROFILE_FALLBACK_REGION[3] * height),
+                round(CONTACT_HEADER_ROI[0] * width),
+                round(CONTACT_HEADER_ROI[1] * height),
+                round(CONTACT_HEADER_ROI[2] * width),
+                round(CONTACT_HEADER_ROI[3] * height),
             )
         crop = image.crop(box)
         if crop.width < 16 or crop.height < 16:
@@ -1203,8 +1623,12 @@ class Win32VisualNavigation:
         self,
         *,
         page_verified: bool,
+        image=None,
         uia_rect: tuple[int, int, int, int] | None = None,
         uia_candidate_provider: Callable[[int | None], str | None] | None = None,
+        open_profile_popup: bool = True,
+        ocr_scale: int = 2,
+        allow_recrop: bool = True,
     ):
         """Prefer verified popup OCR; use the Contacts detail panel only as fallback."""
         import json
@@ -1213,24 +1637,33 @@ class Win32VisualNavigation:
         from wechat_ocr import DEFAULT_CONFIG, WeChatIdExtractor
         from wechat_ocr.extractor import label_diagnostics, reconcile_ocr_result
 
-        frame = getattr(self, "last_stable_frame", None)
+        if image is None:
+            raise NavigationFailure(
+                "PROFILE_FRAME_REQUIRED",
+                "extract_selected_profile requires the current stable profile frame",
+            )
+        frame = image
         right_panel_image, capture_latency = self.profile_image(
             page_verified=page_verified, uia_rect=uia_rect, image=frame
         )
         right_diag = label_diagnostics(self.last_profile_tokens)
         self.last_right_panel_diagnostics = right_diag
-        popup_started = time.perf_counter()
         surface = None
-        self.last_popup_status = PROFILE_POPUP_UNRESOLVED
-        try:
-            surface = self.open_friend_profile_visual(
-                page_verified=page_verified,
-                profile_crop=right_panel_image,
-                profile_tokens=self.last_profile_tokens,
-            )
-        except NavigationFailure as exc:
-            self.last_popup_status = exc.status
-        popup_open_latency = time.perf_counter() - popup_started
+        self.last_popup_status = PROFILE_POPUP_NOT_OPENED
+        self.last_popup_timing = {}
+        popup_open_latency = 0.0
+        if open_profile_popup:
+            popup_started = time.perf_counter()
+            self.last_popup_status = PROFILE_POPUP_UNRESOLVED
+            try:
+                surface = self.open_friend_profile_visual(
+                    page_verified=page_verified,
+                    profile_crop=right_panel_image,
+                    profile_tokens=self.last_profile_tokens,
+                )
+            except NavigationFailure as exc:
+                self.last_popup_status = exc.status
+            popup_open_latency = time.perf_counter() - popup_started
         selected_image = surface.image if surface else right_panel_image
         ui_started = time.perf_counter()
         ui_candidate = (
@@ -1252,7 +1685,9 @@ class Win32VisualNavigation:
                 + json.dumps(benchmark, ensure_ascii=False, separators=(",", ":"))
             )
         started = time.perf_counter()
-        ocr = WeChatIdExtractor(config=DEFAULT_CONFIG).extract(selected_image)
+        ocr = WeChatIdExtractor(config=DEFAULT_CONFIG).extract(
+            selected_image, scale=ocr_scale, allow_recrop=allow_recrop
+        )
         ocr_latency = time.perf_counter() - started
         consensus_started = time.perf_counter()
         result = reconcile_ocr_result(ocr, ui_candidate)
@@ -1329,7 +1764,7 @@ class VisualContactSession:
                 for element in window.descendants(control_type="Text")
             ]
             return extract_wechat_id_from_uia(texts)
-        except Exception:
+        except Exception:  # noqa: BLE001 - inaccessible UIA popups cannot confirm identity.
             return None
 
     def read_contacts(
@@ -1354,6 +1789,7 @@ class VisualContactSession:
                 self.navigator.extract_selected_profile(
                     page_verified=self.page_evidence.confirmed,
                     uia_candidate_provider=self._uia_candidate,
+                    image=getattr(self.navigator, "current_profile_frame", None),
                 )
             )
             popup = getattr(self.navigator, "last_popup_diagnostics", {})

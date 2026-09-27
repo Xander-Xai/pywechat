@@ -8,7 +8,25 @@ the export files the user explicitly asked for, or to an opt-in debug dump.
 
 from __future__ import annotations
 
+import re
+
 _MASK = "***"
+_MASK_PLACEHOLDERS = frozenset("*•·●○…⋯︙")
+_REPEATED_DOTS = re.compile(r"\.{3,}")
+
+
+def contains_mask_placeholder(value: str | None) -> bool:
+    """Return whether an OCR value contains a visible masking placeholder.
+
+    ASCII hyphen and underscore remain valid identifier characters and are
+    deliberately excluded from this check.
+    """
+    if not value:
+        return False
+    text = str(value)
+    return any(char in _MASK_PLACEHOLDERS for char in text) or bool(
+        _REPEATED_DOTS.search(text)
+    )
 
 
 def mask_wechat_id(value: str | None) -> str:
