@@ -96,12 +96,30 @@ def build_telemetry_report(telemetry: dict) -> dict:
         "direction_unverified_events": sum(e.get("scroll_direction") not in {"INITIAL", "FORWARD"} for e in events),
         "telemetry_event_count": len(events),
     }
+    online_metrics = {
+        "profile_clicks": telemetry.get("profile_clicks"),
+        "profile_revisits": telemetry.get("profile_revisits"),
+        "new_profiles": telemetry.get("unique_profiles"),
+        "ocr_calls": telemetry.get("ocr_calls"),
+    }
+    compared_metrics = {
+        name: int(expected)
+        for name, expected in online_metrics.items()
+        if expected is not None
+    }
+    mismatches = {
+        name: {"online": expected, "replayed": value[name]}
+        for name, expected in compared_metrics.items()
+        if expected != value[name]
+    }
     return {
         "benchmark": "WECHAT_NAVIGATION_V2_REPLAY",
         "status": "REPLAY_EVIDENCE_COMPLETE",
         "evidence_kind": "LIVE_BENCHMARK_TELEMETRY",
         "run_id": telemetry.get("run_id"),
         "v2": value,
+        "metrics_match": not mismatches if compared_metrics else None,
+        "metric_mismatches": mismatches,
         "missing_event_streams": [],
     }
 

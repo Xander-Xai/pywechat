@@ -33,6 +33,10 @@ def test_live_replay_reconstructs_metrics_from_anonymous_events():
     report = build_telemetry_report({
         "status": "REPLAY_EVIDENCE_COMPLETE",
         "run_id": "anonymous-run",
+        "profile_clicks": 3,
+        "profile_revisits": 1,
+        "unique_profiles": 2,
+        "ocr_calls": 2,
         "events": [
             {"scroll_direction": "INITIAL", "candidate_indices": [0, 1], "clicks": [
                 {"click_attempts": 1}], "profiles": [
@@ -54,6 +58,21 @@ def test_live_replay_reconstructs_metrics_from_anonymous_events():
     assert report["v2"]["profile_clicks"] == 3
     assert report["v2"]["median_overlap_rows"] == 3.0
     assert report["v2"]["overlap_rows_skipped"] == 3
+    assert report["metrics_match"] is True
+    assert report["metric_mismatches"] == {}
+
+
+def test_live_replay_marks_online_aggregate_mismatch():
+    report = build_telemetry_report({
+        "status": "REPLAY_EVIDENCE_COMPLETE",
+        "profile_clicks": 99,
+        "events": [{"scroll_direction": "INITIAL", "clicks": [{"click_attempts": 1}]}],
+    })
+    assert report["metrics_match"] is False
+    assert report["metric_mismatches"]["profile_clicks"] == {
+        "online": 99,
+        "replayed": 1,
+    }
 
 
 def test_live_replay_refuses_incomplete_telemetry():

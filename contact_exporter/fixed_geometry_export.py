@@ -808,9 +808,13 @@ def _update_navigation_metrics(state: dict) -> dict:
 def _append_benchmark_viewport_event(
     state: dict,
     *,
+    viewport_id: int | None = None,
+    previous_viewport_id: int | None = None,
     viewport_hash: str,
     previous_viewport_hash: str,
     direction: str,
+    alignment_confidence: str | None = None,
+    recovery_state: str | None = None,
     requested_units: int | None,
     anchor_displacement: float | None,
     visible_rows: list[float],
@@ -823,21 +827,51 @@ def _append_benchmark_viewport_event(
     if not BENCHMARK_MODE:
         return
     state["telemetry_event_id"] = int(state.get("telemetry_event_id", 0)) + 1
+    spacing = float(row_spacing)
+    visible_count = len(visible_rows)
+    estimated_rows_advanced = (
+        abs(float(anchor_displacement)) / spacing
+        if anchor_displacement is not None and spacing > 0 else None
+    )
+    estimated_overlap_rows = (
+        max(0.0, visible_count - estimated_rows_advanced)
+        if estimated_rows_advanced is not None else None
+    )
+    overlap_ratio = len(overlap_indices) / visible_count if visible_count else 0.0
     event = {
         "event_id": state["telemetry_event_id"],
+        "viewport_id": int(viewport_id if viewport_id is not None else state.get("viewport", 1)),
+        "previous_viewport_id": previous_viewport_id,
         "timestamp": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
         "viewport_hash": viewport_hash,
         "previous_viewport_hash": previous_viewport_hash,
         "scroll_direction": direction,
+        "alignment_confidence": alignment_confidence or (
+            "INITIAL" if direction == "INITIAL" else "UNCERTAIN"
+        ),
+        "recovery_state": recovery_state or state.get("state", "RUNNING"),
+        "requested_scroll": requested_units,
         "requested_scroll_units": requested_units,
+        "actual_anchor_displacement": anchor_displacement,
         "anchor_displacement": anchor_displacement,
-        "visible_row_count": len(visible_rows),
-        "median_row_spacing": round(float(row_spacing), 3),
+        "estimated_rows_advanced": round(estimated_rows_advanced, 4)
+        if estimated_rows_advanced is not None else None,
+        "estimated_overlap_rows": round(estimated_overlap_rows, 4)
+        if estimated_overlap_rows is not None else None,
+        "visible_row_count": visible_count,
+        "median_row_spacing": round(spacing, 3),
         "row_signature_hashes": list(row_signatures),
+        "overlap_rows": list(overlap_indices),
         "overlap_indices": list(overlap_indices),
+        "overlap_ratio": round(overlap_ratio, 6),
+        "skipped_overlap_rows": list(overlap_indices),
+        "candidate_rows": list(candidate_indices),
         "candidate_indices": list(candidate_indices),
         "clicked_indices": [],
         "profiles": [],
+        "profile_clicks": int(state.get("rows_clicked", 0)),
+        "profile_revisits": int(state.get("profile_revisits", 0)),
+        "new_profiles": int(state.get("unique_profiles_visited", 0)),
         "recovery_type": recovery_type,
     }
     state.setdefault("navigation_telemetry", []).append(event)
@@ -1195,6 +1229,16 @@ def _wait_foreground(hwnd: int, pid: int, state: dict) -> None:
 def _persist(state: dict) -> None:
     _refresh_accounting(state)
     _update_navigation_metrics(state)
+    if BENCHMARK_MODE:
+        events = state.get("navigation_telemetry", [])
+        index = state.get("last_viewport_event_index")
+        if isinstance(index, int) and 0 <= index < len(events):
+            events[index].update({
+                "profile_clicks": int(state.get("rows_clicked", 0)),
+                "profile_revisits": int(state.get("profile_revisits", 0)),
+                "new_profiles": int(state.get("unique_profiles_visited", 0)),
+                "recovery_state": state.get("state", "RUNNING"),
+            })
     snapshot = _checkpoint_snapshot(state)
     with _LIVE_LOCK:
         _atomic_json(CHECKPOINT, snapshot)
@@ -1210,6 +1254,7 @@ def _persist(state: dict) -> None:
                 "profile_revisits": int(state.get("profile_revisits", 0)),
                 "profile_clicks": int(state.get("rows_clicked", 0)),
                 "ocr_calls": int(state.get("extractions_attempted", 0)),
+                "recovery_count": int(state.get("forward_progress_recoveries", 0)),
                 "events": state.get("navigation_telemetry", []),
             })
 
@@ -2900,9 +2945,13 @@ def run(
             state["scroll_extra_notches"] = 0
             _append_benchmark_viewport_event(
                 state,
+                viewport_id=scan_plan.viewport_id,
+                previous_viewport_id=scan_plan.viewport_id - 1,
                 viewport_hash=after_digest,
                 previous_viewport_hash=previous_viewport_hash,
                 direction=direction_status,
+                alignment_confidence=scan_plan.confidence,
+                recovery_state=state.get("state", "RUNNING"),
                 requested_units=actual_units,
                 anchor_displacement=anchor_displacement,
                 visible_rows=new_rows,

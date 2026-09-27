@@ -40,6 +40,52 @@ def _state():
     return {"profile_results": [], "confirmed": [], "review": []}
 
 
+def test_benchmark_viewport_telemetry_records_geometry_and_safety_state(monkeypatch):
+    monkeypatch.setattr(exporter, "BENCHMARK_MODE", True)
+    state = {
+        "viewport": 2,
+        "rows_clicked": 6,
+        "profile_revisits": 1,
+        "unique_profiles_visited": 5,
+        "navigation_telemetry": [],
+    }
+
+    exporter._append_benchmark_viewport_event(
+        state,
+        viewport_id=2,
+        previous_viewport_id=1,
+        viewport_hash="a" * 32,
+        previous_viewport_hash="b" * 32,
+        direction="FORWARD",
+        alignment_confidence="HIGH",
+        recovery_state="RUNNING",
+        requested_units=10,
+        anchor_displacement=-540,
+        visible_rows=list(range(13)),
+        row_spacing=54,
+        row_signatures=[str(i) * 32 for i in range(13)],
+        overlap_indices=[0, 1, 2],
+        candidate_indices=list(range(3, 13)),
+    )
+
+    event = state["navigation_telemetry"][0]
+    assert event["event_id"] == 1
+    assert event["viewport_id"] == 2
+    assert event["previous_viewport_id"] == 1
+    assert event["estimated_rows_advanced"] == 10
+    assert event["estimated_overlap_rows"] == 3
+    assert event["overlap_rows"] == [0, 1, 2]
+    assert event["overlap_ratio"] == pytest.approx(3 / 13, abs=1e-6)
+    assert event["skipped_overlap_rows"] == [0, 1, 2]
+    assert event["candidate_rows"] == list(range(3, 13))
+    assert event["alignment_confidence"] == "HIGH"
+    assert event["profile_clicks"] == 6
+    assert event["profile_revisits"] == 1
+    assert event["new_profiles"] == 5
+    assert event["scroll_direction"] == "FORWARD"
+    assert event["recovery_state"] == "RUNNING"
+
+
 def test_terminal_result_is_the_only_way_profiles_processed_increases():
     state = _state()
     assert state.get("profiles_processed", 0) == 0
