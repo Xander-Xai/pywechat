@@ -765,30 +765,41 @@ class Navigator():
             raise NotStartError
         hwnd=win32gui.FindWindow('Qt51514QWindowIcon','微信')
         if hwnd==0:hwnd=win32gui.FindWindow('Qt51514QWindowIcon','Weixin')
+        if hwnd==0:
+            raise NotFoundError
         main_window=desktop.window(handle=hwnd)
-        if main_window.class_name()=='mmui::LoginWindow':
+        window_class=win32gui.GetClassName(hwnd)
+        if window_class=='mmui::LoginWindow':
             raise NotLoginError
-        if main_window.class_name()=='mmui::MainWindow':
-            main_window.restore()
-            win32gui.SetWindowPos(hwnd,win32con.HWND_TOPMOST, 
-            0, 0,window_size[0],window_size[1],win32con.SWP_NOMOVE)
-            window_width,window_height=window_size[0],window_size[1]
-            screen_width,screen_height=win32api.GetSystemMetrics(win32con.SM_CXSCREEN),win32api.GetSystemMetrics(win32con.SM_CYSCREEN)
-            new_left=(screen_width-window_width)//2
-            new_top=(screen_height-window_height)//2
-            if screen_width!=window_width:
-                #移动窗口到屏幕中央
-                win32gui.MoveWindow(hwnd,new_left,new_top,window_width,window_height,True)
-            ###############################
+        if window_class in ('mmui::MainWindow','Qt51514QWindowIcon'):
+            # Win32 HWND remains available on render-only UIA trees.
+            win32gui.ShowWindow(hwnd,win32con.SW_RESTORE)
             if is_maximize:
                 #需要使用win32gui.SendMessage全屏,main_window.maximize不管用
                 win32gui.SendMessage(hwnd, win32con.WM_SYSCOMMAND, win32con.SC_MAXIMIZE,0)
             if not is_maximize:
                 win32gui.SendMessage(hwnd, win32con.WM_SYSCOMMAND, win32con.SC_RESTORE,0)
+            from .visual_navigation import (
+                AUTO_FOREGROUND_READY,
+                NavigationFailure,
+                foreground_acquisition_state,
+                foreground_wechat_window,
+            )
+
+            foreground_ready = foreground_wechat_window(hwnd)
+            foreground_status = foreground_acquisition_state(
+                target_is_foreground=False,
+                auto_request_succeeded=foreground_ready,
+                operator_fallback_enabled=True,
+            )
+            if foreground_status != AUTO_FOREGROUND_READY:
+                raise NavigationFailure(foreground_status)
             offline_button=main_window.child_window(**Buttons.OffLineButton)
-            Tools.cancel_pin(main_window)
-            if offline_button.exists(timeout=0.1):
-                main_window.close()
+            try:
+                offline=offline_button.exists(timeout=0.1)
+            except Exception:
+                offline=False
+            if offline:
                 raise NetWorkError('当前网络不可用,无法进行UI自动化!')
         else:
             raise NotFoundError
@@ -1163,10 +1174,64 @@ class Navigator():
         if is_maximize is None:
             is_maximize=GlobalConfig.is_maximize
         main_window=Navigator.open_weixin(is_maximize=is_maximize)
-        main_window.child_window(**SideBar.Contacts).click_input()
-        contacts_list=main_window.child_window(**Lists.ContactsList)
-        contacts_list.type_keys('{HOME}')
-        return contacts_list,main_window
+        from .visual_navigation import (
+            AUTO_FOREGROUND_READY,
+            NavigationFailure,
+            VisualContactSession,
+            Win32VisualNavigation,
+            foreground_acquisition_state,
+            foreground_wechat_window,
+        )
+        import win32con
+        import win32gui
+
+        navigator=Win32VisualNavigation(main_window.handle)
+        uia_contacts_hint=False
+        uia_list_hint=False
+        try:
+            contacts_button=main_window.child_window(**SideBar.Contacts)
+            if contacts_button.exists(timeout=0.15):
+                uia_contacts_hint=True
+                contacts_button.click_input()
+                time.sleep(0.4)
+                contacts_list=main_window.child_window(**Lists.ContactsList)
+                uia_list_hint=contacts_list.exists(timeout=0.15)
+                if uia_list_hint:
+                    try:
+                        navigator.confirm_current_contacts(uia_list_hint=True)
+                        # Preserve the currently selected contact. Batch
+                        # export starts here and advances one item at a time.
+                        return contacts_list,main_window
+                    except NavigationFailure:
+                        pass
+        except Exception:
+            # Empty UIA trees are a normal visual-fallback condition.
+            pass
+
+        try:
+            evidence=navigator.confirm_current_contacts(uia_list_hint=uia_list_hint)
+            return VisualContactSession(
+                navigator, evidence, uia_window=main_window
+            ), main_window
+        except NavigationFailure:
+            pass
+
+        win32gui.ShowWindow(main_window.handle,win32con.SW_RESTORE)
+        foreground_ready = foreground_wechat_window(main_window.handle)
+        foreground_status = foreground_acquisition_state(
+            target_is_foreground=False,
+            auto_request_succeeded=foreground_ready,
+            operator_fallback_enabled=True,
+        )
+        if foreground_status != AUTO_FOREGROUND_READY:
+            raise NavigationFailure(foreground_status)
+        evidence=navigator.open_contacts(
+            uia_hint=uia_contacts_hint,
+            uia_list_hint=uia_list_hint,
+        )
+        return VisualContactSession(
+            navigator, evidence, uia_window=main_window
+        ), main_window
 
     @staticmethod
     def open_contacts_manage(is_maximize:bool=None,window_maximize:bool=None,close_weixin:bool=None)->WindowSpecification:
